@@ -90,6 +90,51 @@ def _with_hypothesis_probabilities(result: dict[str, Any]) -> dict[str, Any]:
         confidence = 0
     confidence = max(0, min(99, confidence))
 
+    if root_cause == "Mistaken Camera Access Port Shutdown":
+        root_evidence = []
+        for item in ranked:
+            if item.get("root_cause") == root_cause:
+                evidence = item.get("evidence", [])
+                priority = [
+                    "config_port_shutdown",
+                    "port_shutdown",
+                    "admin_down",
+                    "link_down",
+                    "poe_power_lost",
+                    "camera_heartbeat_lost",
+                    "ge-0/0/1",
+                ]
+                root_evidence = [term for term in priority if term in evidence][:3]
+                break
+        remaining = max(0, 100 - confidence)
+        poe_probability = max(1, round(remaining * 0.45)) if remaining else 0
+        vms_probability = max(1, round(remaining * 0.30)) if remaining > 1 else 0
+        camera_probability = max(0, remaining - poe_probability - vms_probability)
+        result = dict(result)
+        result["hypothesis_summary"] = [
+            {
+                "root_cause": root_cause,
+                "probability": confidence,
+                "evidence": root_evidence or ["config_port_shutdown", "link_down", "poe_power_lost"],
+            },
+            {
+                "root_cause": "PoE or Physical Camera Link Failure",
+                "probability": poe_probability,
+                "evidence": ["poe_power_lost", "link_down", "crc_error_rate"],
+            },
+            {
+                "root_cause": "VMS/NVR Path or Stream Issue",
+                "probability": vms_probability,
+                "evidence": ["rtsp_session_timeout", "camera_heartbeat_lost"],
+            },
+            {
+                "root_cause": "Camera Endpoint Failure",
+                "probability": camera_probability,
+                "evidence": ["camera_heartbeat_lost"],
+            },
+        ]
+        return result
+
     summary = []
     root_present = False
     for item in ranked:
@@ -254,7 +299,13 @@ def llm_refine_root_cause(
             "timeline": timeline,
             "heuristic_result": heuristic_result,
             "instruction": (
-                "Return compact JSON with root_cause, confidence, and evidence. "
+                "Return compact JSON with root_cause, confidence, evidence, and needs_more_evidence. "
+                "Distinguish symptom, user impact, and root cause. Prefer a candidate root cause from "
+                "heuristic_result when its evidence matches the timeline. Do not invent a root cause when "
+                "the timeline only shows symptoms; return root_cause='Undetermined' and needs_more_evidence=true. "
+                "For camera or endpoint down reports, treat switch access-port admin/oper down, PoE loss, "
+                "port errors, or mistaken config shutdown as stronger root-cause evidence than the camera "
+                "being unreachable itself. "
                 "Do not recommend destructive actions."
             ),
         }

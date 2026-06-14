@@ -104,14 +104,14 @@ def _timeline_lines(timeline: list[dict[str, Any]], limit: int = 6) -> list[str]
 def _hypothesis_lines(root: dict[str, Any], limit: int = 3) -> list[str]:
     hypotheses = root.get("hypothesis_summary") or []
     if not hypotheses:
-        return ["• <i>No hypothesis ranking available</i>"]
+        return ["• <i>Chưa đủ dữ liệu để xếp hạng giả định</i>"]
 
     lines = []
     for index, item in enumerate(hypotheses[:limit], start=1):
         cause = _safe(item.get("root_cause", "Unknown"))
         probability = _safe(item.get("probability", 0))
         evidence = item.get("evidence") or []
-        evidence_text = f" · {_safe(', '.join(map(str, evidence[:2])))}" if evidence else ""
+        evidence_text = f" · signal: {_safe(', '.join(map(str, evidence[:2])))}" if evidence else ""
         lines.append(f"{index}. <b>{cause}</b> · <code>{probability}%</code>{evidence_text}")
     return lines
 
@@ -124,43 +124,53 @@ def format_telegram_report(assessment: dict[str, Any]) -> str:
     method = root.get("method", "heuristic")
     model = root.get("llm_model", "")
     immediate = rec.get("immediate_actions", [])
+    verification = rec.get("verification_actions", [])
+    issue = assessment.get("alert_message") or assessment.get("title") or "Incident requires investigation"
+    source = assessment.get("alert_source") or "unknown"
+    needs_more_evidence = bool(root.get("needs_more_evidence")) or root.get("root_cause") == "Undetermined"
+    confidence_note = "Chưa đủ bằng chứng, cần admin xác minh thêm." if needs_more_evidence else "Có đủ tín hiệu để ưu tiên kiểm tra giả định đứng đầu."
 
     lines = [
-        "🚨 <b>AIOps Incident Assessment</b>",
+        "🚨 <b>AIOps Incident Alert</b>",
         f"{_severity_badge(str(severity))} · <code>{_safe(assessment.get('incident_id', 'unknown'))}</code>",
-        f"Category: <b>{_safe(assessment.get('category', 'unknown')).title()}</b>",
+        f"Loại: <b>{_safe(assessment.get('category', 'unknown')).title()}</b> · Nguồn: <code>{_safe(source)}</code>",
+        f"Mô tả: <b>{_safe(issue)}</b>",
         "",
-        "🎯 <b>RCA Summary</b>",
-        f"Most likely: <code>{_safe(root.get('root_cause', 'Unknown'))}</code>",
-        f"Confidence: {_confidence_badge(root.get('confidence', 0))}",
+        "🎯 <b>Nhận định RCA</b>",
+        f"Root cause khả năng cao: <code>{_safe(root.get('root_cause', 'Unknown'))}</code>",
+        f"Độ tin cậy: {_confidence_badge(root.get('confidence', 0))}",
+        f"<i>{_safe(confidence_note)}</i>",
         "",
-        "🧠 <b>Hypotheses</b>",
+        "🧠 <b>Giả định & xác suất</b>",
     ]
-    lines.extend(_hypothesis_lines(root, limit=3))
+    lines.extend(_hypothesis_lines(root, limit=4))
     lines.extend(
         [
             "",
-            "🕒 <b>Timeline Snapshot</b>",
+            "🕒 <b>Timeline rút gọn</b>",
         ]
     )
-    lines.extend(_timeline_lines(timeline, limit=4))
+    lines.extend(_timeline_lines(timeline, limit=5))
     lines.extend(
         [
             "",
-            "⚡ <b>Next Action</b>",
+            "⚡ <b>Việc cần làm ngay</b>",
         ]
     )
-    lines.append(f"1. {_safe(immediate[0] if immediate else 'Preserve evidence and verify alert state')}")
+    lines.extend(_numbered_lines(immediate, limit=3))
+    lines.extend(["", "✅ <b>Xác minh</b>"])
+    lines.extend(_item_lines(verification, limit=2, icon="•"))
     lines.extend(
         [
             "",
             f"Method: <code>{_safe(method)}</code>" + (f" · Model: <code>{_safe(model)}</code>" if model else ""),
             f"Status: <b>{_safe(assessment.get('status', 'Need verification'))}</b>",
-            "",
-            "<i>Use the buttons below for full timeline, evidence, and actions.</i>",
         ]
     )
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if len(text) > 3600:
+        return text[:3590].rstrip() + "\n..."
+    return text
 
 
 def format_telegram_timeline_detail(assessment: dict[str, Any]) -> str:

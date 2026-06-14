@@ -29,6 +29,8 @@ TOPOLOGY = {
     "wan": "ISP-HCM-EDGE",
     "security": "SEC-MON-01",
     "vmware": "VCENTER-HCM-01",
+    "camera": "CAM-01",
+    "nvr": "NVR-HQ-01",
 }
 
 
@@ -54,10 +56,14 @@ def _build_topology(template: IncidentTemplate) -> dict[str, Any]:
         "edge_router": TOPOLOGY["edge_router"],
         "dns_server": TOPOLOGY["dns_server"],
         "app_server": TOPOLOGY["app_server"],
+        "camera": TOPOLOGY["camera"],
+        "nvr": TOPOLOGY["nvr"],
         "vmware_cluster": "VSPHERE-CLUSTER-01",
         "impacted_node": impacted,
         "impacted_service": template.impacted_service,
         "links": [
+            {"from": "CAM-01", "to": "ARUBA-ACC-03", "type": "camera-access"},
+            {"from": "NVR-HQ-01", "to": "JUN-CORE-01", "type": "video-recording"},
             {"from": "ARUBA-ACC-03", "to": "JUN-CORE-01", "type": "uplink"},
             {"from": "JUN-CORE-01", "to": "FGT-HQ-01", "type": "core-to-firewall"},
             {"from": "FGT-HQ-01", "to": "ISP-HCM-EDGE", "type": "internet"},

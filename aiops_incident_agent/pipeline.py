@@ -21,8 +21,11 @@ def analyze_incident(incident: dict[str, Any], send_telegram: bool = False) -> d
 
     assessment = {
         "incident_id": incident.get("incident_id"),
+        "title": incident.get("title"),
         "category": incident.get("category"),
         "severity": (incident.get("alert") or {}).get("severity", "unknown"),
+        "alert_message": (incident.get("alert") or {}).get("message", ""),
+        "alert_source": (incident.get("alert") or {}).get("source", "unknown"),
         "timeline": timeline,
         "correlation": correlation,
         "root_cause_analysis": root_cause_analysis,
