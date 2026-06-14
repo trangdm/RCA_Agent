@@ -131,6 +131,8 @@ class AIOpsMVPTest(unittest.TestCase):
         self.assertEqual(response["intent"], "start_investigation")
         self.assertEqual(response["intake"]["matched_template"], "internet-congestion")
         self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Internet Congestion")
+        self.assertIn("tạo incident demo", response["reply"])
+        self.assertIn("Khá rõ rồi", response["reply"])
 
     def test_telegram_chat_db_disconnect_maps_to_service_crash(self):
         with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
@@ -193,10 +195,11 @@ class AIOpsMVPTest(unittest.TestCase):
         self.assertEqual(second["session"]["message_count"], 2)
         self.assertIn("09:30-10:00", second["session"]["time_windows"])
         self.assertEqual(second["assessment"]["root_cause_analysis"]["root_cause"], "Internet Congestion")
-        self.assertIn("RCA Investigation", second["reply"])
+        self.assertIn("chạy lại RCA", second["reply"])
+        self.assertIn("Mình dựa vào", second["reply"])
         self.assertIn("09:30:00 UTC", second["reply"])
         self.assertEqual(question["intent"], "continue_investigation")
-        self.assertIn("Timeline/log", question["reply"])
+        self.assertIn("Timeline đáng chú ý", question["reply"])
 
 
 if __name__ == "__main__":

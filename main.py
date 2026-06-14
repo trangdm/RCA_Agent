@@ -402,49 +402,95 @@ def _format_action_section(assessment: dict) -> list[str]:
     return [f"{index}. {_html(action)}" for index, action in enumerate(actions[:5], start=1)]
 
 
+def _system_timeline(assessment: dict) -> list[dict]:
+    timeline = assessment.get("timeline", [])
+    return [
+        event for event in timeline if event.get("source") != "operator" and not str(event.get("event_type", "")).startswith("operator_")
+    ] or timeline
+
+
+def _evidence_snippets(assessment: dict, limit: int = 3) -> list[str]:
+    snippets = []
+    root = assessment.get("root_cause_analysis", {})
+    ranked = root.get("ranked_hypotheses") or []
+    for item in ranked[:1]:
+        for evidence in item.get("evidence", [])[:limit]:
+            snippets.append(str(evidence))
+    if len(snippets) < limit:
+        for event in _system_timeline(assessment):
+            event_type = str(event.get("event_type", "event"))
+            if event_type not in snippets:
+                snippets.append(event_type)
+            if len(snippets) >= limit:
+                break
+    return snippets[:limit]
+
+
+def _natural_next_question(root: dict, focus: str) -> str:
+    confidence = int(root.get("confidence", 0) or 0)
+    if root.get("needs_more_evidence") or confidence < 70:
+        return "Bạn gửi thêm giúp mình log raw, metric hoặc change history trong khoảng thời gian lỗi; mình sẽ ráp lại timeline và giảm bớt giả định."
+    if focus == "change":
+        return "Nếu bạn có ticket/change ID hoặc config diff thật, gửi tiếp cho mình; mình sẽ đối chiếu với timeline hiện tại."
+    if focus == "action":
+        return "Sau khi bạn thử bước đầu tiên, gửi kết quả verify lại; mình sẽ xem root cause còn giữ được không."
+    return "Bạn có thể gửi thêm log, metric, impact hoặc hypothesis của bạn; mình sẽ cập nhật incident này và phân tích lại."
+
+
 def _format_investigation_reply(session: dict, incident: dict, assessment: dict, focus: str, latest_text: str) -> str:
     root = assessment.get("root_cause_analysis", {})
     confidence = int(root.get("confidence", 0) or 0)
     notes = _session_notes(session)
-    header = "🧭 <b>RCA Investigation</b>"
-    lines = [
-        header,
-        f"Incident: <code>{_html(session['incident_id'])}</code> · cập nhật #{len(session['messages'])}",
-        f"Ghi nhận mới: {_html(_short_text(latest_text, 180))}",
-    ]
+    root_cause = root.get("root_cause", "Unknown")
+    is_first_message = len(session["messages"]) == 1
+    evidence = _evidence_snippets(assessment)
+    incident_line = (
+        f"Mình đã tạo incident demo <code>{_html(session['incident_id'])}</code> từ mô tả của bạn và rà log/metric/change history synthetic tương ứng."
+        if is_first_message
+        else f"Mình đã thêm thông tin này vào incident <code>{_html(session['incident_id'])}</code> và chạy lại RCA."
+    )
+
+    if root.get("needs_more_evidence") or root_cause == "Undetermined":
+        verdict = (
+            "Hiện mình chưa chốt root cause được. Dữ liệu đang có mới đủ để dựng hướng điều tra, chưa đủ để kết luận chắc."
+        )
+    elif confidence >= 80:
+        verdict = f"Khá rõ rồi: khả năng cao là <code>{_html(root_cause)}</code> với độ tin cậy khoảng <b>{confidence}%</b>."
+    else:
+        verdict = f"Mình đang nghiêng về <code>{_html(root_cause)}</code>, nhưng độ tin cậy mới khoảng <b>{confidence}%</b> nên vẫn cần kiểm chứng thêm."
+
+    lines = [f"Ok, mình nhận rồi. {incident_line}", "", verdict]
+
+    if evidence:
+        lines.append("")
+        lines.append("Mình dựa vào mấy tín hiệu chính này:")
+        for item in evidence:
+            lines.append(f"• <code>{_html(item)}</code>")
+
     if notes:
-        lines.extend(["", "<b>Context đang có</b>"])
+        lines.append("")
+        lines.append("Context mình đang giữ trong cuộc điều tra này:")
         lines.extend(f"• {_html(note)}" for note in notes)
 
-    lines.extend(["", "<b>Nhận định hiện tại</b>"])
-    lines.extend(_format_rca_section(assessment))
-
     if focus == "change":
-        lines.extend(["", "<b>Change/config rà soát được</b>"])
+        lines.extend(["", "Mình kiểm tra phần change/config trước. Trong dữ liệu hiện tại mình thấy:"])
         lines.extend(_format_change_section(incident))
     elif focus == "timeline":
-        lines.extend(["", "<b>Timeline/log đáng chú ý</b>"])
+        lines.extend(["", "Timeline đáng chú ý mình xâu chuỗi được là:"])
         lines.extend(_format_timeline_section(assessment, limit=10))
+    elif focus == "rca":
+        lines.extend(["", "Nếu nhìn riêng phần RCA thì ranking hiện tại là:"])
+        lines.extend(_format_rca_section(assessment))
     elif focus == "action":
-        lines.extend(["", "<b>Hành động đề xuất</b>"])
+        lines.extend(["", "Mình sẽ xử lý theo thứ tự này trước:"])
         lines.extend(_format_action_section(assessment))
     else:
-        lines.extend(["", "<b>Timeline/log đáng chú ý</b>"])
-        lines.extend(_format_timeline_section(assessment, limit=5))
-        lines.extend(["", "<b>Hành động tiếp theo</b>"])
+        lines.extend(["", "Timeline ngắn mình thấy như sau:"])
+        lines.extend(_format_timeline_section(assessment, limit=4))
+        lines.extend(["", "Bước đầu tiên nên làm:"])
         lines.extend(_format_action_section(assessment)[:3])
 
-    if root.get("needs_more_evidence") or confidence < 70:
-        lines.extend(
-            [
-                "",
-                "<b>Cần bổ sung để kết luận chắc hơn</b>",
-                "• Log raw quanh incident window",
-                "• Metric liên quan CPU/memory/disk/session/latency/packet loss",
-                "• Change history hoặc ticket gần thời điểm lỗi",
-                "• Phạm vi impact: user/service/site/device nào bị ảnh hưởng",
-            ]
-        )
+    lines.extend(["", _html(_natural_next_question(root, focus))])
 
     text = "\n".join(lines)
     if len(text) > 3800:
