@@ -11,9 +11,10 @@ from greennode_agentbase import GreenNodeAgentBaseApp, PingStatus, RequestContex
 
 from aiops_incident_agent.evaluator import evaluate_incidents
 from aiops_incident_agent.generator import generate_dataset, generate_incident
-from aiops_incident_agent.intake import build_incident_from_report
+from aiops_incident_agent.intake import build_incident_from_report, match_report_template, normalize_text
 from aiops_incident_agent.catalog import TEMPLATES, TEMPLATES_BY_KEY, IncidentTemplate
 from aiops_incident_agent.pipeline import analyze_incident
+from aiops_incident_agent.telegram import send_telegram_report
 
 
 load_dotenv()
@@ -88,6 +89,107 @@ def _analyst_reply(incident: dict, assessment: dict) -> str:
     )
 
 
+def _telegram_message(payload: dict) -> tuple[str | int | None, str, dict]:
+    message = None
+    for key in ("message", "edited_message", "channel_post"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            message = value
+            break
+    if message is None and isinstance(payload.get("callback_query"), dict):
+        message = payload["callback_query"].get("message") or {}
+        if not message.get("text"):
+            message = dict(message)
+            message["text"] = payload["callback_query"].get("data", "")
+
+    if not isinstance(message, dict):
+        return None, "", {}
+
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    text = str(message.get("text") or message.get("caption") or "").strip()
+    return chat_id, text, message
+
+
+def _is_help_text(text: str) -> bool:
+    normalized = normalize_text(text)
+    return normalized in {"/start", "start", "/help", "help", "tro giup", "huong dan"}
+
+
+def _help_reply() -> str:
+    return "\n".join(
+        [
+            "🤖 <b>AIOps RCA Agent</b>",
+            "",
+            "Bạn có thể chat tự nhiên, ví dụ:",
+            "• tạo ra incident ngẫu nhiên",
+            "• internet chậm kết nối hãy kiểm tra có gì bất thường không",
+            "• mất kết nối server DB-01 có gì bất thường không",
+            "• port ge-0/0/1 bị flap nhiều lần có ghi nhận gì bất thường không",
+            "",
+            "Agent sẽ tạo incident demo liên quan, phân tích RCA và gửi alert tại đây.",
+        ]
+    )
+
+
+def _is_random_demo_request(text: str) -> bool:
+    normalized = normalize_text(text)
+    if any(term in normalized for term in ("ngau nhien", "random", "bat ky")):
+        return True
+
+    create_terms = ("tao incident", "tao su co", "sinh incident", "sinh su co", "tao alert", "demo alert")
+    if any(term in normalized for term in create_terms):
+        match = match_report_template(text)
+        return int(match.get("score", 0)) <= 0
+    return False
+
+
+def _handle_telegram_chat(text: str, chat_id: str | int | None = None) -> dict:
+    if not text:
+        reply = _help_reply()
+        delivery = send_telegram_report(reply, chat_id=chat_id) if chat_id is not None else {"sent": False}
+        return {"status": "success", "workflow": "telegram_chat", "intent": "help", "reply": reply, "telegram_delivery": delivery}
+
+    if _is_help_text(text):
+        reply = _help_reply()
+        delivery = send_telegram_report(reply, chat_id=chat_id) if chat_id is not None else {"sent": False}
+        return {"status": "success", "workflow": "telegram_chat", "intent": "help", "reply": reply, "telegram_delivery": delivery}
+
+    if _is_random_demo_request(text):
+        result = _alert_from_generated(
+            {"incident_type": "random", "send_telegram": False},
+            default_prefix="INC-TELEGRAM-DEMO",
+        )
+        result["workflow"] = "telegram_chat"
+        result["intent"] = "proactive_alert"
+        result["chat_text"] = text
+        delivery = send_telegram_report(result["assessment"]["telegram_report"], chat_id=chat_id) if chat_id is not None else {"sent": False}
+        result["telegram_delivery"] = delivery
+        return result
+
+    normalized = build_incident_from_report(
+        {
+            "message": text,
+            "source": "telegram-chat",
+            "send_telegram": False,
+        }
+    )
+    incident = normalized["incident"]
+    assessment = analyze_incident(incident, send_telegram=False)
+    delivery = send_telegram_report(assessment["telegram_report"], chat_id=chat_id) if chat_id is not None else {"sent": False}
+    return {
+        "status": "success",
+        "workflow": "telegram_chat",
+        "intent": "record_incident",
+        "chat_text": text,
+        "intake": normalized["intake"],
+        "incident": incident,
+        "assessment": assessment,
+        "reply": _analyst_reply(incident, assessment),
+        "telegram_delivery": delivery,
+    }
+
+
 def _alert_from_generated(payload: dict, default_prefix: str) -> dict:
     generated = _generate_from_payload(payload, default_prefix=default_prefix)
     if generated.get("status") != "success":
@@ -117,8 +219,14 @@ def handler(payload: dict, context: RequestContext) -> dict:
     - generate: generate one synthetic incident.
     - proactive_alert: generate/analyze/notify a synthetic incident.
     - record_incident: normalize a user report, analyze it, and respond.
+    - telegram_chat: handle Telegram-style chat text or webhook updates.
     - evaluate: generate/evaluate a synthetic dataset, or evaluate provided incidents.
     """
+
+    if "operation" not in payload:
+        chat_id, text, message = _telegram_message(payload)
+        if message:
+            return _handle_telegram_chat(text, chat_id=chat_id)
 
     operation = payload.get("operation", "analyze")
 
@@ -171,6 +279,13 @@ def handler(payload: dict, context: RequestContext) -> dict:
             "assessment": assessment,
             "reply": _analyst_reply(incident, assessment),
         }
+
+    if operation in {"telegram_chat", "chat"}:
+        chat_id = payload.get("chat_id")
+        text = payload.get("text") or payload.get("message") or payload.get("description") or ""
+        if isinstance(text, dict):
+            chat_id, text, _ = _telegram_message(payload)
+        return _handle_telegram_chat(str(text), chat_id=chat_id)
 
     return {"status": "error", "message": f"Unsupported operation: {operation}"}
 

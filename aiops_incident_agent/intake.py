@@ -13,15 +13,49 @@ from .generator import TOPOLOGY, generate_incident
 ROOT_CAUSE_ALIASES = {
     "Broadcast Loop": ("vong lap", "loop", "broadcast storm", "mac flapping", "storm", "arp flood"),
     "STP Failure": ("stp", "spanning tree", "bpdu", "root bridge", "topology change"),
-    "Interface Flapping": ("flapping", "flap", "link up down", "port up down", "cong chap chon"),
+    "Interface Flapping": (
+        "flapping",
+        "flap",
+        "link up down",
+        "port up down",
+        "cong chap chon",
+        "interface flap",
+        "port flap",
+        "ge 0/0/1",
+    ),
     "Routing Issue": ("routing", "route", "bgp", "ospf", "mat route", "routing loop"),
     "Firewall Session Exhaustion": ("firewall", "fortigate", "session", "session spike", "session exhaustion"),
     "DNS Failure": ("dns", "resolve", "khong phan giai", "nxdomain", "dns timeout"),
-    "Internet Congestion": ("internet cham", "congestion", "wan", "isp", "latency", "packet loss"),
+    "Internet Congestion": (
+        "internet cham",
+        "congestion",
+        "wan",
+        "isp",
+        "latency",
+        "packet loss",
+        "ket noi cham",
+        "mang cham",
+        "slow internet",
+        "internet slow",
+    ),
     "Disk Full": ("disk full", "day disk", "o dia day", "no space", "filesystem full"),
     "CPU Exhaustion": ("cpu high", "cpu cao", "cpu exhaustion", "load average", "high load"),
     "Memory Leak": ("memory leak", "ram tang", "oom", "out of memory", "bo nho"),
-    "Service Crash": ("service crash", "crash", "process exited", "service down", "dich vu dung"),
+    "Service Crash": (
+        "service crash",
+        "crash",
+        "process exited",
+        "service down",
+        "dich vu dung",
+        "mat ket noi server",
+        "khong ket noi server",
+        "server unreachable",
+        "connection refused",
+        "database down",
+        "db down",
+        "db 01",
+        "db-01",
+    ),
     "VMware Datastore Full": ("datastore", "vmware datastore", "ds full", "thin provision"),
     "VMware Host Failure": ("esxi", "vmware host", "host failure", "ha failover", "host down"),
     "Brute Force Attack": ("brute force", "login failed", "failed login", "dang nhap that bai", "ssh failed"),
@@ -127,6 +161,12 @@ def _normalize_text(value: Any) -> str:
     for src, dst in replacements.items():
         text = text.replace(src, dst)
     return text.replace("_", " ").replace("-", " ")
+
+
+def normalize_text(value: Any) -> str:
+    """Public wrapper used by chat intake code."""
+
+    return _normalize_text(value)
 
 
 def _score_template(template: IncidentTemplate, text: str) -> tuple[int, list[str]]:

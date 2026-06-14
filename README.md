@@ -180,6 +180,31 @@ Record an incident reported by an operator, analyze it, and return a reply:
 `record_incident` also accepts a full `incident` JSON payload if the caller
 already has structured alert, metric, log, topology, and change-history data.
 
+## Telegram Chat
+
+Point the Telegram bot webhook to the AgentBase invocation endpoint:
+
+```powershell
+$endpoint = "https://<agentbase-endpoint-host>/invocations"
+$token = "<telegram-bot-token>"
+Invoke-RestMethod -Method Post `
+  -Uri "https://api.telegram.org/bot$token/setWebhook" `
+  -Body @{ url = $endpoint; drop_pending_updates = "true" }
+```
+
+After that, users can chat directly with the bot:
+
+```text
+tạo ra incident ngẫu nhiên
+internet chậm kết nối hãy kiểm tra có gì bất thường hay không
+mất kết nối server DB-01 có gì bất thường không
+port ge-0/0/1 bị flap nhiều lần có ghi nhận gì bất thường không
+```
+
+The agent treats open-ended Telegram messages as demo incident intake: it
+generates the closest related synthetic incident, runs RCA, and sends the
+formatted Telegram assessment back to the same chat.
+
 ## Run Server Locally
 
 ```powershell

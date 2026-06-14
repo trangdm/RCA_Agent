@@ -163,17 +163,17 @@ def format_telegram_payload(text: str) -> dict[str, Any]:
     }
 
 
-def send_telegram_report(text: str) -> dict[str, Any]:
+def send_telegram_report(text: str, chat_id: str | int | None = None) -> dict[str, Any]:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if _is_placeholder(token) or _is_placeholder(chat_id):
+    target_chat_id = str(chat_id) if chat_id is not None else os.getenv("TELEGRAM_CHAT_ID")
+    if _is_placeholder(token) or _is_placeholder(target_chat_id):
         return {"sent": False, "reason": "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured"}
 
     try:
         import requests
 
         payload = format_telegram_payload(text)
-        payload["chat_id"] = chat_id
+        payload["chat_id"] = target_chat_id
         response = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json=payload,

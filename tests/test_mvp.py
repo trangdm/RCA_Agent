@@ -1,6 +1,7 @@
 from datetime import datetime
 import os
 import unittest
+from unittest.mock import patch
 
 os.environ["AIOPS_USE_LLM"] = "false"
 
@@ -101,6 +102,58 @@ class AIOpsMVPTest(unittest.TestCase):
         self.assertEqual(response["status"], "success")
         self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Undetermined")
         self.assertTrue(response["assessment"]["root_cause_analysis"]["needs_more_evidence"])
+
+    def test_telegram_chat_random_incident_request(self):
+        update = {
+            "update_id": 1,
+            "message": {"message_id": 1, "chat": {"id": 12345}, "text": "tạo ra incident ngẫu nhiên"},
+        }
+        with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
+            response = handler(update, None)
+        self.assertEqual(response["status"], "success")
+        self.assertEqual(response["workflow"], "telegram_chat")
+        self.assertEqual(response["intent"], "proactive_alert")
+        self.assertIn("assessment", response)
+
+    def test_telegram_chat_internet_slow_maps_to_congestion(self):
+        with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
+            response = handler(
+                {
+                    "operation": "telegram_chat",
+                    "chat_id": 12345,
+                    "text": "internet chậm kết nối hãy kiểm tra có gì bất thường hay không",
+                },
+                None,
+            )
+        self.assertEqual(response["intent"], "record_incident")
+        self.assertEqual(response["intake"]["matched_template"], "internet-congestion")
+        self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Internet Congestion")
+
+    def test_telegram_chat_db_disconnect_maps_to_service_crash(self):
+        with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
+            response = handler(
+                {
+                    "operation": "telegram_chat",
+                    "chat_id": 12345,
+                    "text": "mất kết nối server DB-01 có gì bất thường không",
+                },
+                None,
+            )
+        self.assertEqual(response["intake"]["matched_template"], "service-crash")
+        self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Service Crash")
+
+    def test_telegram_chat_port_flap_maps_to_interface_flapping(self):
+        with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
+            response = handler(
+                {
+                    "operation": "telegram_chat",
+                    "chat_id": 12345,
+                    "text": "port ge-0/0/1 bị flap nhiều lần có ghi nhận gì bất thường không",
+                },
+                None,
+            )
+        self.assertEqual(response["intake"]["matched_template"], "interface-flapping")
+        self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Interface Flapping")
 
 
 if __name__ == "__main__":
