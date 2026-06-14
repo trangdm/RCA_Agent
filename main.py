@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from html import escape
+from html import escape, unescape
+import os
 import random
 import re
 import sys
@@ -11,6 +12,9 @@ from typing import Any
 
 from dotenv import load_dotenv
 from greennode_agentbase import GreenNodeAgentBaseApp, PingStatus, RequestContext
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from aiops_incident_agent.catalog import TEMPLATES, TEMPLATES_BY_KEY, IncidentTemplate
 from aiops_incident_agent.evaluator import evaluate_incidents
@@ -29,6 +33,18 @@ for stream in (sys.stdout, sys.stderr):
 
 
 app = GreenNodeAgentBaseApp()
+_cors_origins = [
+    origin.strip()
+    for origin in os.getenv("AIOPS_CHAT_CORS_ORIGINS", "").split(",")
+    if origin.strip() and origin.strip() != "*"
+]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
 INVESTIGATION_SESSIONS: dict[str, dict[str, Any]] = {}
 INVESTIGATION_SESSION_LIMIT = 100
 
@@ -470,6 +486,189 @@ def _format_chat_reply(session: dict[str, Any], incident: dict[str, Any], assess
     return text
 
 
+def _new_web_session_id() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    suffix = random.SystemRandom().randint(1000, 9999)
+    return f"web-{timestamp}-{suffix}"
+
+
+def _web_session_key(session_id: str) -> str:
+    return f"web:{session_id}"
+
+
+def _strip_html(value: object) -> str:
+    text = str(value or "")
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    return unescape(text).strip()
+
+
+def _compact_timeline(assessment: dict[str, Any], limit: int = 8) -> list[dict[str, Any]]:
+    events = [event for event in assessment.get("timeline", []) if event.get("signal") not in {"noise", "baseline"}]
+    if not events:
+        events = list(assessment.get("timeline", []))
+    return [
+        {
+            "time": event.get("time"),
+            "type": event.get("type"),
+            "source": event.get("source"),
+            "event": event.get("event"),
+            "severity": event.get("severity"),
+        }
+        for event in events[:limit]
+    ]
+
+
+def _web_chat_response(
+    session_id: str,
+    result: dict[str, Any],
+    include_assessment: bool = False,
+) -> dict[str, Any]:
+    assessment = result.get("assessment") or {}
+    session = result.get("session") or {}
+    reply_html = result.get("reply") or assessment.get("telegram_report") or ""
+    response: dict[str, Any] = {
+        "status": result.get("status", "success"),
+        "workflow": "web_chat",
+        "intent": result.get("intent"),
+        "session_id": session_id,
+        "incident_id": assessment.get("incident_id") or session.get("incident_id"),
+        "reply_html": reply_html,
+        "reply_text": _strip_html(reply_html),
+        "root_cause": assessment.get("most_likely_root_cause"),
+        "confidence": assessment.get("confidence"),
+        "rca_status": assessment.get("status"),
+        "summary": assessment.get("summary"),
+        "impact": assessment.get("impact"),
+        "evidence": assessment.get("evidence", []),
+        "timeline": _compact_timeline(assessment),
+        "recommended_actions": assessment.get("recommended_actions", {}),
+        "missing_data": assessment.get("missing_data", []),
+        "session": session,
+        "intake": result.get("intake", {}),
+    }
+    if include_assessment:
+        response["assessment"] = assessment
+        if "incident" in result:
+            response["incident"] = result["incident"]
+    return response
+
+
+def _handle_web_chat(payload: dict[str, Any]) -> dict[str, Any]:
+    """Handle web chat requests without sending Telegram messages."""
+
+    text = str(payload.get("message") or payload.get("text") or "").strip()
+    session_id = str(payload.get("session_id") or _new_web_session_id()).strip()
+    if not session_id:
+        session_id = _new_web_session_id()
+    key = _web_session_key(session_id)
+    include_assessment = _as_bool(payload.get("include_assessment"), default=False)
+
+    if not text or _is_help_text(text):
+        reply = _help_reply()
+        return _web_chat_response(
+            session_id,
+            {
+                "status": "success",
+                "intent": "help",
+                "reply": reply,
+                "session": {"session_id": session_id, "message_count": 0},
+            },
+            include_assessment=include_assessment,
+        )
+
+    if _is_close_command(text):
+        INVESTIGATION_SESSIONS.pop(key, None)
+        reply = "✅ <b>Đã đóng web chat session.</b>\nGửi mô tả mới để bắt đầu RCA tiếp."
+        return _web_chat_response(
+            session_id,
+            {
+                "status": "success",
+                "intent": "close_investigation",
+                "reply": reply,
+                "session": {"session_id": session_id, "message_count": 0},
+            },
+            include_assessment=include_assessment,
+        )
+
+    if _is_random_demo_request(text):
+        result = _alert_from_generated(
+            {"incident_type": "random", "send_telegram": False},
+            default_prefix="INC-WEB-DEMO",
+        )
+        result["intent"] = "proactive_alert"
+        result["reply"] = result.get("reply") or (result.get("assessment") or {}).get("telegram_report", "")
+        result["session"] = {"session_id": session_id, "message_count": 0}
+        return _web_chat_response(session_id, result, include_assessment=include_assessment)
+
+    session = _session_for_message(key, text)
+    built = _build_session_incident(session)
+    incident = built["incident"]
+    assessment = analyze_incident(incident, send_telegram=False)
+    session["last_incident"] = incident
+    session["last_assessment"] = assessment
+    focus = _detect_focus(text)
+    reply = _format_chat_reply(session, incident, assessment, focus)
+    result = {
+        "status": "success",
+        "intent": "start_investigation" if len(session["messages"]) == 1 else "continue_investigation",
+        "session": {
+            "session_id": session_id,
+            "incident_id": session["incident_id"],
+            "message_count": len(session["messages"]),
+            "time_windows": session["time_windows"],
+            "entities": session["entities"],
+        },
+        "intake": built["intake"],
+        "incident": incident,
+        "assessment": assessment,
+        "reply": reply,
+    }
+    return _web_chat_response(session_id, result, include_assessment=include_assessment)
+
+
+async def web_chat_endpoint(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "message": "Invalid JSON body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"status": "error", "message": "JSON body must be an object"}, status_code=400)
+    return JSONResponse(_handle_web_chat(payload))
+
+
+async def web_chat_session_endpoint(request: Request) -> JSONResponse:
+    session_id = request.path_params.get("session_id", "")
+    key = _web_session_key(str(session_id))
+    session = INVESTIGATION_SESSIONS.get(key)
+    if not session:
+        return JSONResponse({"status": "success", "found": False, "session_id": session_id})
+    assessment = session.get("last_assessment") or {}
+    return JSONResponse(
+        {
+            "status": "success",
+            "found": True,
+            "session_id": session_id,
+            "session": {
+                "incident_id": session.get("incident_id"),
+                "message_count": len(session.get("messages", [])),
+                "time_windows": session.get("time_windows", []),
+                "entities": session.get("entities", []),
+                "created_at": session.get("created_at"),
+                "updated_at": session.get("updated_at"),
+            },
+            "root_cause": assessment.get("most_likely_root_cause"),
+            "confidence": assessment.get("confidence"),
+            "rca_status": assessment.get("status"),
+        }
+    )
+
+
+app.add_route("/chat", web_chat_endpoint, methods=["POST"])
+app.add_route("/chat/sessions/{session_id}", web_chat_session_endpoint, methods=["GET"])
+
+
 def _handle_telegram_chat(text: str, chat_id: str | int | None = None) -> dict[str, Any]:
     if not text or _is_help_text(text):
         reply = _help_reply()
@@ -581,12 +780,15 @@ def handler(payload: dict[str, Any], context: RequestContext | None) -> dict[str
             "reply": _brief_reply(assessment),
         }
 
-    if operation in {"telegram_chat", "chat"}:
+    if operation in {"telegram_chat"}:
         chat_id = payload.get("chat_id")
         text = payload.get("text") or payload.get("message") or payload.get("description") or ""
         if isinstance(text, dict):
             chat_id, text, _ = _telegram_message(payload)
         return _handle_telegram_chat(str(text), chat_id=chat_id)
+
+    if operation in {"web_chat", "web/chat", "chat_endpoint", "chat"}:
+        return _handle_web_chat(payload)
 
     if operation == "evaluate":
         incidents = payload.get("incidents")

@@ -4,6 +4,8 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
+from starlette.testclient import TestClient
+
 
 os.environ["AIOPS_USE_LLM"] = "false"
 os.environ["AIOPS_STORE_PATH"] = "data/test_incidents.sqlite3"
@@ -15,7 +17,7 @@ from aiops_incident_agent.intake import build_incident_from_report
 from aiops_incident_agent.pipeline import analyze_incident
 from aiops_incident_agent.telegram import format_telegram_payload
 from aiops_incident_agent.timeline import build_timeline
-from main import INVESTIGATION_SESSIONS, handler
+from main import INVESTIGATION_SESSIONS, app, handler
 
 
 STORE_PATH = Path(os.environ["AIOPS_STORE_PATH"])
@@ -117,6 +119,44 @@ class AIOpsRCARebuildTest(unittest.TestCase):
         self.assertIn("incident demo", response["reply"])
         self.assertEqual(follow_up["intent"], "continue_investigation")
         self.assertIn("Change/config", follow_up["reply"])
+
+    def test_web_chat_invocation_keeps_session(self):
+        first = handler({"operation": "web_chat", "message": "camera 01 down, check port switch"}, None)
+        self.assertEqual(first["status"], "success")
+        self.assertEqual(first["workflow"], "web_chat")
+        self.assertEqual(first["intent"], "start_investigation")
+        self.assertIn("session_id", first)
+        self.assertEqual(first["root_cause"], "Interface flapping")
+        self.assertIn("reply_html", first)
+        self.assertIn("reply_text", first)
+
+        second = handler(
+            {
+                "operation": "web_chat",
+                "session_id": first["session_id"],
+                "message": "co change config trong khoang 09:30-10:00 khong",
+            },
+            None,
+        )
+        self.assertEqual(second["intent"], "continue_investigation")
+        self.assertEqual(second["session_id"], first["session_id"])
+        self.assertEqual(second["session"]["message_count"], 2)
+        self.assertIn("Change/config", second["reply_text"])
+
+    def test_web_chat_http_route(self):
+        with TestClient(app) as client:
+            response = client.post("/chat", json={"message": "port ge-0/0/1 flap nhieu lan"})
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            self.assertEqual(body["status"], "success")
+            self.assertEqual(body["workflow"], "web_chat")
+            self.assertEqual(body["root_cause"], "Interface flapping")
+
+            session_response = client.get(f"/chat/sessions/{body['session_id']}")
+            self.assertEqual(session_response.status_code, 200)
+            session_body = session_response.json()
+            self.assertTrue(session_body["found"])
+            self.assertEqual(session_body["session"]["message_count"], 1)
 
 
 if __name__ == "__main__":

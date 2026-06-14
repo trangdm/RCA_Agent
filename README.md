@@ -199,6 +199,83 @@ Get latest stored analysis:
 }
 ```
 
+## Web Chat Endpoint
+
+The runtime now exposes a web-friendly chat API in addition to AgentBase
+`/invocations`.
+
+Direct HTTP route:
+
+```http
+POST /chat
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{
+  "message": "camera 01 down, check port switch co bat thuong khong",
+  "session_id": "optional-existing-session-id",
+  "include_assessment": false
+}
+```
+
+Response includes both renderable HTML and plain text:
+
+```json
+{
+  "status": "success",
+  "workflow": "web_chat",
+  "intent": "start_investigation",
+  "session_id": "web-...",
+  "incident_id": "INC-INV-...",
+  "reply_html": "...",
+  "reply_text": "...",
+  "root_cause": "Interface flapping",
+  "confidence": 96,
+  "rca_status": "need_verification",
+  "summary": "...",
+  "evidence": [],
+  "timeline": [],
+  "recommended_actions": {},
+  "missing_data": []
+}
+```
+
+Continue the same conversation by sending the returned `session_id`:
+
+```json
+{
+  "message": "co change config trong khoang 09:30-10:00 khong",
+  "session_id": "web-..."
+}
+```
+
+Session lookup:
+
+```http
+GET /chat/sessions/{session_id}
+```
+
+If your frontend cannot call `/chat` directly because the platform proxy only
+exposes `/invocations`, use the same behavior through:
+
+```json
+{
+  "operation": "web_chat",
+  "message": "port ge-0/0/1 flap nhieu lan",
+  "session_id": "optional-existing-session-id"
+}
+```
+
+For browser apps hosted on another domain, set a comma-separated allowlist in
+runtime env:
+
+```env
+AIOPS_CHAT_CORS_ORIGINS=https://your-web-domain.example
+```
+
 Send a Telegram test:
 
 ```json
