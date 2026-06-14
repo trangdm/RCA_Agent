@@ -2,233 +2,255 @@
 
 from __future__ import annotations
 
-import json
-import os
+import re
 from typing import Any
 
-import requests
+from .catalog import TEMPLATES, TEMPLATES_BY_ROOT_CAUSE, IncidentTemplate
 
-from .catalog import TEMPLATES
+
+def _normalize(value: Any) -> str:
+    text = str(value or "").lower()
+    text = text.replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _flatten(value: Any) -> str:
+    if isinstance(value, dict):
+        return " ".join(_flatten(item) for key, item in value.items() if key not in {"ground_truth_root_cause", "scenario_key"})
+    if isinstance(value, list):
+        return " ".join(_flatten(item) for item in value)
+    if isinstance(value, tuple):
+        return " ".join(_flatten(item) for item in value)
+    return str(value or "")
 
 
 def _incident_text(incident: dict[str, Any], timeline: list[dict[str, Any]]) -> str:
-    parts = [
-        incident.get("title", ""),
-        incident.get("alert", {}).get("message", ""),
-        incident.get("category", ""),
-    ]
-    for event in timeline:
-        parts.extend([event.get("event_type", ""), event.get("source", ""), event.get("message", "")])
-    for metric in incident.get("metrics", []):
-        parts.extend([metric.get("metric", ""), str(metric.get("value", "")), metric.get("source", "")])
-    for change in incident.get("change_history", []):
-        parts.extend([change.get("device", ""), change.get("action", "")])
-    return " ".join(parts).lower()
-
-
-def _score_templates(text: str) -> list[dict[str, Any]]:
-    ranked = []
-    for template in TEMPLATES:
-        matched = []
-        score = 0
-        for term in template.signatures:
-            normalized = term.lower().replace(" ", "_")
-            loose = normalized.replace("_", " ")
-            if normalized in text or loose in text:
-                matched.append(term)
-                score += 10
-        if template.root_cause.lower() in text:
-            score += 20
-            matched.append(template.root_cause)
-        if template.category in text:
-            score += 2
-        ranked.append(
+    scoped = {
+        "title": incident.get("title"),
+        "category": incident.get("category"),
+        "alert": incident.get("alert"),
+        "logs": incident.get("logs"),
+        "metrics": incident.get("metrics"),
+        "topology": incident.get("topology"),
+        "recent_changes": incident.get("recent_changes") or incident.get("change_history"),
+        "baseline": incident.get("baseline"),
+        "timeline": [
             {
-                "root_cause": template.root_cause,
-                "category": template.category,
-                "score": score,
-                "evidence": sorted(set(matched)),
+                "event": event.get("event"),
+                "source": event.get("source"),
+                "event_type": event.get("event_type"),
+                "type": event.get("type"),
             }
-        )
-    ranked.sort(key=lambda item: item["score"], reverse=True)
-    return ranked
+            for event in timeline
+            if event.get("signal") != "noise"
+        ],
+        "intake": incident.get("intake"),
+        "investigation_context": incident.get("investigation_context"),
+    }
+    return _normalize(_flatten(scoped))
 
 
-def heuristic_root_cause(incident: dict[str, Any], timeline: list[dict[str, Any]]) -> dict[str, Any]:
-    """Deterministic root-cause scoring used for offline operation."""
+def _term_matches(term: str, text: str) -> bool:
+    normalized = _normalize(term)
+    return bool(normalized) and normalized in text
 
-    text = _incident_text(incident, timeline)
-    ranked = _score_templates(text)
-    top = ranked[0]
-    if top["score"] <= 0:
-        return {
-            "root_cause": "Undetermined",
-            "confidence": 35,
-            "method": "heuristic",
-            "ranked_hypotheses": ranked[:5],
-            "needs_more_evidence": True,
-        }
-    second = ranked[1] if len(ranked) > 1 else {"score": 0}
-    margin = max(0, top["score"] - second["score"])
-    confidence = min(95, max(45, 55 + margin * 2 + min(top["score"], 50) // 2))
+
+def _score_template(template: IncidentTemplate, text: str, incident: dict[str, Any]) -> dict[str, Any]:
+    matched_terms: list[str] = []
+    score = 0
+    candidate_terms = [
+        template.key,
+        template.root_cause,
+        template.alert_message,
+        template.impacted_service,
+        *template.signatures,
+        *template.symptoms,
+        *(event["event_type"] for event in template.log_events),
+        *(point["metric"] for point in template.metric_series),
+    ]
+    for term in candidate_terms:
+        if _term_matches(str(term), text):
+            matched_terms.append(str(term))
+            score += 10
+
+    for change in incident.get("recent_changes") or incident.get("change_history") or []:
+        change_text = _normalize(_flatten(change))
+        if any(_term_matches(term, change_text) for term in template.signatures):
+            score += 12
+            matched_terms.append("recent_change_match")
+            break
+
+    if incident.get("category") == template.category:
+        score += 3
+
     return {
-        "root_cause": top["root_cause"],
-        "confidence": confidence,
-        "method": "heuristic",
-        "ranked_hypotheses": ranked[:5],
+        "template": template,
+        "score": score,
+        "matched_terms": sorted(set(matched_terms)),
     }
 
 
-def _is_placeholder(value: str | None) -> bool:
-    return not value or value.strip().upper().startswith("REPLACE_ME")
-
-
-def _iter_model_items(payload: Any) -> list[dict[str, Any]]:
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if not isinstance(payload, dict):
-        return []
-    for key in ("data", "listData", "models", "items"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            return [item for item in value if isinstance(item, dict)]
-    return []
-
-
-def _parse_llm_json(content: str) -> dict[str, Any]:
-    """Parse JSON even when the model wraps it in markdown or prose."""
-
-    stripped = content.strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
-
-    try:
-        parsed = json.loads(stripped)
-        return parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        pass
-
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(content):
-        if char not in "{[":
+def _collect_supporting_evidence(template: IncidentTemplate, timeline: list[dict[str, Any]], limit: int = 8) -> list[str]:
+    evidence: list[str] = []
+    terms = tuple(template.signatures) + tuple(event["event_type"] for event in template.log_events)
+    for event in timeline:
+        if event.get("signal") == "noise":
             continue
-        try:
-            parsed, _ = decoder.raw_decode(content[index:])
-        except json.JSONDecodeError:
-            continue
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
+        event_text = _normalize(" ".join(str(event.get(key, "")) for key in ("event", "event_type", "source", "type")))
+        if any(_term_matches(term, event_text) for term in terms):
+            evidence.append(f"{event.get('time')} {event.get('source')}: {event.get('event')}")
+        if len(evidence) >= limit:
+            break
+    return evidence
 
 
-def resolve_llm_model(api_key: str, base_url: str) -> str | None:
-    """Resolve a model id from the OpenAI-compatible /models endpoint.
-
-    If LLM_MODEL is not explicitly configured, this lets the user only provide
-    the GreenNode MaaS API key and a provider preference such as "minimax".
-    """
-
-    provider_preference = os.getenv("LLM_MODEL_PROVIDER", "minimax").lower()
-    try:
-        response = requests.get(
-            f"{base_url.rstrip('/')}/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=15,
-        )
-        response.raise_for_status()
-        models = _iter_model_items(response.json())
-    except Exception:
-        return None
-
-    preferred = []
-    fallback = []
-    for model in models:
-        model_id = model.get("id") or model.get("path") or model.get("code") or model.get("name")
-        if not model_id:
-            continue
-        searchable = " ".join(
-            str(model.get(key, "")) for key in ("id", "path", "code", "name", "provider", "description")
-        ).lower()
-        status = str(model.get("modelStatus") or model.get("status") or "").upper()
-        disabled = status in {"DISABLED", "INACTIVE", "DELETED"}
-        if provider_preference and provider_preference in searchable and not disabled:
-            preferred.append(str(model_id))
-        elif not disabled:
-            fallback.append(str(model_id))
-
-    if preferred:
-        return preferred[0]
-    if fallback:
-        return fallback[0]
-    return None
+def _collect_symptoms(timeline: list[dict[str, Any]], limit: int = 8) -> list[str]:
+    symptoms: list[str] = []
+    for event in timeline:
+        if event.get("type") == "symptom" and event.get("signal") != "baseline":
+            symptoms.append(f"{event.get('source')}: {event.get('event')}")
+        if len(symptoms) >= limit:
+            break
+    return symptoms
 
 
-def llm_refine_root_cause(
+def _collect_impact(timeline: list[dict[str, Any]]) -> str:
+    impacts = [event for event in timeline if event.get("type") == "impact" and event.get("signal") != "noise"]
+    if impacts:
+        return "; ".join(f"{event.get('source')}: {event.get('event')}" for event in impacts[:3])
+    return "No explicit impact was found in the incident payload."
+
+
+def _confidence(score: int, second_score: int, evidence_count: int) -> int:
+    if score <= 0:
+        return 35
+    margin = max(0, score - second_score)
+    confidence = 45 + min(35, score // 2) + min(15, margin)
+    if evidence_count >= 4:
+        confidence += 8
+    elif evidence_count < 2:
+        confidence = min(confidence, 65)
+    return min(96, max(35, confidence))
+
+
+def _hypothesis(
+    template: IncidentTemplate,
+    confidence: int,
+    supporting_evidence: list[str],
+    score: int,
+) -> dict[str, Any]:
+    contradicting: list[str] = []
+    if score <= 0:
+        contradicting.append("No matching log, metric, topology, or recent-change evidence in the incident payload.")
+    elif not supporting_evidence:
+        contradicting.append("Matched weak text signals, but no concrete timeline event supports this hypothesis.")
+
+    missing_data = list(template.missing_data)
+    if confidence < 70:
+        missing_data.insert(0, "Additional correlated log, metric, or change evidence is required before confirming root cause.")
+
+    return {
+        "hypothesis": template.root_cause,
+        "confidence": confidence,
+        "supporting_evidence": supporting_evidence,
+        "contradicting_evidence": contradicting,
+        "missing_data": missing_data,
+        "verification_steps": list(template.verification_steps),
+    }
+
+
+def _first_related_event(timeline: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for event in timeline:
+        if event.get("signal") not in {"noise", "baseline"}:
+            return event
+    return timeline[0] if timeline else None
+
+
+def _summary(
     incident: dict[str, Any],
     timeline: list[dict[str, Any]],
-    heuristic_result: dict[str, Any],
-) -> dict[str, Any]:
-    """Optionally ask an OpenAI-compatible LLM to refine the RCA result.
+    most_likely: str,
+    confidence: int,
+    symptoms: list[str],
+) -> str:
+    first_event = _first_related_event(timeline)
+    start_text = "unknown time"
+    first_text = "no clear first event"
+    if first_event:
+        start_text = str(first_event.get("time", "unknown time"))
+        first_text = f"{first_event.get('source')}: {first_event.get('event')}"
 
-    The function is disabled unless AIOPS_USE_LLM=true and the LLM env vars are
-    configured. It returns the heuristic result on any error.
-    """
-
-    if os.getenv("AIOPS_USE_LLM", "false").lower() not in {"1", "true", "yes"}:
-        return heuristic_result
-
-    api_key = os.getenv("LLM_API_KEY")
-    base_url = os.getenv("LLM_BASE_URL")
-    model = os.getenv("LLM_MODEL")
-    if _is_placeholder(api_key) or _is_placeholder(base_url):
-        return heuristic_result
-    if _is_placeholder(model):
-        model = resolve_llm_model(api_key=api_key, base_url=base_url or "")
-    if not model:
-        result = dict(heuristic_result)
-        result["llm_error"] = "LLM_MODEL is not set and no suitable model could be resolved from /models"
-        return result
-
-    try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        prompt = {
-            "incident": incident,
-            "timeline": timeline,
-            "heuristic_result": heuristic_result,
-            "instruction": (
-                "Return compact JSON with root_cause, confidence, and evidence. "
-                "Do not recommend destructive actions."
-            ),
-        }
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are an AIOps incident investigation analyst."},
-                {"role": "user", "content": json.dumps(prompt, ensure_ascii=True)},
-            ],
-            temperature=0.1,
+    alert_message = (incident.get("alert") or {}).get("message") or incident.get("title") or "incident"
+    if most_likely == "Undetermined":
+        return (
+            f"{alert_message}. Timeline starts at {start_text} with {first_text}. "
+            "The available evidence is not strong enough to confirm one root cause."
         )
-        content = response.choices[0].message.content or "{}"
-        parsed = _parse_llm_json(content)
-        if parsed.get("root_cause"):
-            parsed.setdefault("method", "llm")
-            parsed.setdefault("llm_model", model)
-            parsed.setdefault("ranked_hypotheses", heuristic_result.get("ranked_hypotheses", []))
-            return parsed
-    except Exception as exc:  # pragma: no cover - defensive fallback for optional LLM path
-        result = dict(heuristic_result)
-        result["llm_error"] = str(exc)
-        return result
 
-    return heuristic_result
+    symptom_text = "; ".join(symptoms[:3]) if symptoms else "no explicit symptom list"
+    return (
+        f"{alert_message}. Timeline starts at {start_text} with {first_text}. "
+        f"Correlated symptoms include {symptom_text}. The most likely root cause is "
+        f"{most_likely} with {confidence}% confidence and still needs verification."
+    )
 
 
-def analyze_root_cause(incident: dict[str, Any], timeline: list[dict[str, Any]]) -> dict[str, Any]:
-    heuristic = heuristic_root_cause(incident, timeline)
-    return llm_refine_root_cause(incident, timeline, heuristic)
+def analyze_root_cause(
+    incident: dict[str, Any],
+    timeline: list[dict[str, Any]],
+    correlation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return RCA fields matching the MVP internal JSON contract."""
+
+    text = _incident_text(incident, timeline)
+    scored = [_score_template(template, text, incident) for template in TEMPLATES]
+    scored.sort(key=lambda item: item["score"], reverse=True)
+
+    hypotheses: list[dict[str, Any]] = []
+    for index, item in enumerate(scored[:5]):
+        template = item["template"]
+        supporting = _collect_supporting_evidence(template, timeline)
+        second_score = scored[1]["score"] if index == 0 and len(scored) > 1 else scored[0]["score"]
+        if index > 0:
+            second_score = scored[0]["score"]
+        confidence = _confidence(int(item["score"]), int(second_score), len(supporting))
+        hypotheses.append(_hypothesis(template, confidence, supporting, int(item["score"])))
+
+    top = hypotheses[0] if hypotheses else None
+    confidence = int(top["confidence"]) if top else 35
+    evidence = list(top.get("supporting_evidence", [])) if top else []
+    most_likely = str(top["hypothesis"]) if top and confidence >= 70 and evidence else "Undetermined"
+    status = "insufficient_data" if confidence < 70 or most_likely == "Undetermined" else "need_verification"
+    if incident.get("confirmed_root_cause") and incident.get("confirmed_root_cause") == most_likely:
+        status = "confirmed"
+
+    missing_data: list[str] = []
+    if top:
+        missing_data.extend(top.get("missing_data", []))
+    if not evidence:
+        missing_data.insert(0, "No concrete timeline evidence supports a confirmed root cause.")
+    missing_data = list(dict.fromkeys(missing_data))
+
+    symptoms = _collect_symptoms(timeline)
+    impact = _collect_impact(timeline)
+    severity = (incident.get("alert") or {}).get("severity", "unknown")
+
+    return {
+        "incident_id": incident.get("incident_id", ""),
+        "severity": severity,
+        "summary": _summary(incident, timeline, most_likely, confidence, symptoms),
+        "symptoms": symptoms,
+        "impact": impact,
+        "root_cause_hypotheses": hypotheses,
+        "most_likely_root_cause": most_likely,
+        "confidence": confidence,
+        "evidence": evidence,
+        "missing_data": missing_data,
+        "status": status,
+        "method": "deterministic_timeline_correlation",
+        "correlation": correlation or {},
+    }
+
+
+def template_for_root_cause(root_cause: str) -> IncidentTemplate | None:
+    return TEMPLATES_BY_ROOT_CAUSE.get(root_cause)

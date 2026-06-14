@@ -6,30 +6,11 @@ from datetime import datetime, timedelta, timezone
 import random
 from typing import Any
 
-from .catalog import TEMPLATES, IncidentTemplate
+from .catalog import COMMON_TOPOLOGY, TEMPLATES, IncidentTemplate
 
 
-TOPOLOGY = {
-    "firewall": "FGT-HQ-01",
-    "core_switch": "JUN-CORE-01",
-    "access_switch": "ARUBA-ACC-03",
-    "edge_router": "RTR-HQ-01",
-    "dns_server": "DNS-HQ-01",
-    "internet_edge": "ISP-HCM-EDGE",
-    "app_server": "APP-PRD-01",
-    "vmware_datastore": "DS-PRD-01",
-    "vmware_host": "ESX-HCM-07",
-    "identity_server": "IAM-PRD-01",
-    "endpoint": "WIN-OPS-042",
-    "server_subnet": "SRV-VLAN-120",
-    "switch": "JUN-CORE-01",
-    "router": "RTR-HQ-01",
-    "server": "APP-PRD-01",
-    "dns": "DNS-HQ-01",
-    "wan": "ISP-HCM-EDGE",
-    "security": "SEC-MON-01",
-    "vmware": "VCENTER-HCM-01",
-}
+TOPOLOGY = COMMON_TOPOLOGY
+LOWER_IS_BAD_METRICS = {"route_count", "service_availability"}
 
 
 def _iso(dt: datetime) -> str:
@@ -37,33 +18,150 @@ def _iso(dt: datetime) -> str:
 
 
 def _device(role: str) -> str:
-    return TOPOLOGY.get(role, role.upper())
+    return TOPOLOGY.get(role, role)
 
 
-def _jitter(value: int, rng: random.Random, ratio: float = 0.08) -> int:
-    delta = max(1, int(abs(value) * ratio))
-    return max(0, value + rng.randint(-delta, delta))
+def _new_timestamp(start: datetime, offset_minutes: int | float, jitter_seconds: int = 0) -> str:
+    return _iso(start + timedelta(minutes=float(offset_minutes), seconds=jitter_seconds))
+
+
+def _metric_breach(metric: str, value: int | float, threshold: int | float | None, phase: str) -> bool:
+    if threshold is None:
+        return False
+    if phase == "before":
+        return False
+    if metric in LOWER_IS_BAD_METRICS:
+        return value < threshold
+    return value >= threshold
 
 
 def _build_topology(template: IncidentTemplate) -> dict[str, Any]:
-    impacted = _device(template.topology_role)
+    impacted_node = _device(template.topology_role)
     return {
         "firewall": TOPOLOGY["firewall"],
         "core_switch": TOPOLOGY["core_switch"],
         "access_switch": TOPOLOGY["access_switch"],
         "edge_router": TOPOLOGY["edge_router"],
         "dns_server": TOPOLOGY["dns_server"],
-        "app_server": TOPOLOGY["app_server"],
-        "vmware_cluster": "VSPHERE-CLUSTER-01",
-        "impacted_node": impacted,
+        "linux_server": TOPOLOGY["linux_server"],
+        "windows_server": TOPOLOGY["windows_server"],
+        "vmware_cluster": TOPOLOGY["vmware_cluster"],
+        "vmware_datastore": TOPOLOGY["vmware_datastore"],
+        "identity_server": TOPOLOGY["identity_server"],
+        "wazuh": TOPOLOGY["wazuh"],
+        "impacted_node": impacted_node,
         "impacted_service": template.impacted_service,
         "links": [
-            {"from": "ARUBA-ACC-03", "to": "JUN-CORE-01", "type": "uplink"},
-            {"from": "JUN-CORE-01", "to": "FGT-HQ-01", "type": "core-to-firewall"},
-            {"from": "FGT-HQ-01", "to": "ISP-HCM-EDGE", "type": "internet"},
-            {"from": "APP-PRD-01", "to": "JUN-CORE-01", "type": "server-access"},
+            {"from": "ARUBA-ACC-03", "to": "JUN-CORE-01", "type": "access-uplink"},
+            {"from": "JUN-CORE-01", "to": "FGT-HQ-01", "type": "core-firewall"},
+            {"from": "FGT-HQ-01", "to": "ISP-HCM-EDGE", "type": "internet-edge"},
+            {"from": "APP-LNX-01", "to": "JUN-CORE-01", "type": "server-access"},
+            {"from": "WIN-APP-01", "to": "JUN-CORE-01", "type": "server-access"},
+            {"from": "VCENTER-HCM-01", "to": "DS-PRD-01", "type": "storage"},
+            {"from": "WAZUH-MGR-01", "to": "IAM-PRD-01", "type": "security-monitoring"},
         ],
     }
+
+
+def _build_changes(template: IncidentTemplate, start: datetime, rng: random.Random) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
+    for index, change in enumerate(template.change_events, start=1):
+        changes.append(
+            {
+                "change_id": f"CHG-{rng.randint(100000, 999999)}-{index}",
+                "time": _new_timestamp(start, change["offset"], rng.randint(0, 20)),
+                "device": _device(str(change["device_role"])),
+                "action": str(change["action"]),
+                "actor": str(change.get("actor", "synthetic-operator")),
+                "status": "in_change",
+                "source": "change_calendar",
+            }
+        )
+    return sorted(changes, key=lambda item: item["time"])
+
+
+def _build_logs(template: IncidentTemplate, start: datetime, rng: random.Random) -> list[dict[str, Any]]:
+    logs: list[dict[str, Any]] = []
+    for event in template.log_events:
+        logs.append(
+            {
+                "timestamp": _new_timestamp(start, event["offset"], rng.randint(0, 35)),
+                "source": _device(str(event["source_role"])),
+                "event_type": str(event["event_type"]),
+                "severity": str(event.get("severity", template.severity)),
+                "message": str(event["message"]),
+                "role": str(event.get("role", "evidence")),
+                "signal": "related",
+            }
+        )
+    for event in template.noise_events:
+        logs.append(
+            {
+                "timestamp": _new_timestamp(start, event["offset"], rng.randint(0, 35)),
+                "source": _device(str(event["source_role"])),
+                "event_type": str(event["event_type"]),
+                "severity": str(event.get("severity", "info")),
+                "message": str(event["message"]),
+                "role": "noise",
+                "signal": "noise",
+            }
+        )
+    return sorted(logs, key=lambda item: item["timestamp"])
+
+
+def _build_metrics(template: IncidentTemplate, start: datetime, rng: random.Random) -> list[dict[str, Any]]:
+    metrics: list[dict[str, Any]] = []
+    for point in template.metric_series:
+        value = point["value"]
+        phase = str(point.get("phase", "during"))
+        metric = str(point["metric"])
+        threshold = point.get("threshold")
+        metrics.append(
+            {
+                "timestamp": _new_timestamp(start, point["offset"], rng.randint(0, 25)),
+                "source": _device(str(point["source_role"])),
+                "metric": metric,
+                "value": value,
+                "unit": str(point.get("unit", "")),
+                "threshold": threshold,
+                "phase": phase,
+                "breach": _metric_breach(metric, value, threshold, phase),
+            }
+        )
+    return sorted(metrics, key=lambda item: item["timestamp"])
+
+
+def _build_scenario_timeline(incident: dict[str, Any]) -> list[dict[str, str]]:
+    timeline: list[dict[str, str]] = []
+    for change in incident.get("recent_changes", []):
+        timeline.append(
+            {
+                "time": change["time"],
+                "event": change["action"],
+                "source": change["device"],
+                "type": "change",
+            }
+        )
+    for log in incident.get("logs", []):
+        if log.get("signal") == "noise":
+            continue
+        timeline.append(
+            {
+                "time": log["timestamp"],
+                "event": log["message"],
+                "source": log["source"],
+                "type": str(log.get("role", "evidence")),
+            }
+        )
+    timeline.append(
+        {
+            "time": incident["alert"]["timestamp"],
+            "event": incident["alert"]["message"],
+            "source": incident["alert"]["source"],
+            "type": "symptom",
+        }
+    )
+    return sorted(timeline, key=lambda item: item["time"])
 
 
 def generate_incident(
@@ -76,105 +174,85 @@ def generate_incident(
 
     rng = random.Random(seed)
     start = base_time or datetime(2026, 6, 14, 3, 0, tzinfo=timezone.utc)
-    change_time = start
-    first_signal = start + timedelta(minutes=4 + rng.randint(0, 2))
-    alert_time = first_signal + timedelta(minutes=4 + rng.randint(0, 2))
-    impact_time = alert_time + timedelta(minutes=2 + rng.randint(0, 2))
+    alert_offset = 6
 
-    source_device = _device(template.topology_role)
-    change_device = _device(template.change_device_role)
-
-    logs = []
-    for index, event_type in enumerate(template.log_events):
-        ts = first_signal + timedelta(minutes=index, seconds=rng.randint(0, 45))
-        logs.append(
-            {
-                "timestamp": _iso(ts),
-                "source": source_device,
-                "event_type": event_type,
-                "severity": template.severity if index >= len(template.log_events) - 2 else "warning",
-                "message": f"{event_type.replace('_', ' ')} observed on {source_device}",
-            }
-        )
-
-    metrics = []
-    for index, (source_role, metric, value, threshold, unit) in enumerate(template.metric_points):
-        observed = _jitter(value, rng)
-        metrics.append(
-            {
-                "timestamp": _iso(alert_time + timedelta(seconds=index * 30)),
-                "source": _device(source_role),
-                "metric": metric,
-                "value": observed,
-                "unit": unit,
-                "threshold": threshold,
-                "breach": observed >= threshold if threshold else observed > 0,
-            }
-        )
-
+    changes = _build_changes(template, start, rng)
+    logs = _build_logs(template, start, rng)
+    metrics = _build_metrics(template, start, rng)
     alert = {
-        "timestamp": _iso(alert_time),
+        "timestamp": _new_timestamp(start, alert_offset, rng.randint(0, 20)),
         "severity": template.severity,
         "message": template.alert_message,
-        "source": source_device,
+        "source": _device(template.topology_role),
     }
 
-    change_history = [
-        {
-            "time": _iso(change_time),
-            "device": change_device,
-            "action": template.change_action,
-            "actor": "synthetic-operator",
-        }
-    ]
-
-    logs.append(
-        {
-            "timestamp": _iso(impact_time),
-            "source": template.impacted_service,
-            "event_type": "user_impact",
-            "severity": template.severity,
-            "message": f"Users report impact on {template.impacted_service}",
-        }
-    )
-
-    return {
+    incident = {
         "incident_id": incident_id,
+        "scenario_key": template.key,
         "category": template.category,
         "title": template.alert_message,
         "generated_at": _iso(datetime.now(timezone.utc)),
         "ground_truth_root_cause": template.root_cause,
         "alert": alert,
+        "logs": logs,
         "metrics": metrics,
-        "logs": sorted(logs, key=lambda item: item["timestamp"]),
         "topology": _build_topology(template),
-        "change_history": change_history,
+        "recent_changes": changes,
+        "change_history": list(changes),
+        "baseline": {
+            "metrics": dict(template.baseline),
+            "normal_behavior": template.summary,
+            "impact_reference": template.impact,
+        },
     }
+    incident["scenario_timeline"] = _build_scenario_timeline(incident)
+    return incident
+
+
+def generate_required_scenarios(seed: int = 42) -> list[dict[str, Any]]:
+    """Generate one incident for each required MVP scenario."""
+
+    rng = random.Random(seed)
+    base = datetime(2026, 6, 14, 1, 0, tzinfo=timezone.utc)
+    incidents: list[dict[str, Any]] = []
+    for index, template in enumerate(TEMPLATES, start=1):
+        incidents.append(
+            generate_incident(
+                incident_id=f"INC-{index:03d}",
+                template=template,
+                base_time=base + timedelta(minutes=index * 30),
+                seed=rng.randint(1, 10_000_000),
+            )
+        )
+    return incidents
 
 
 def generate_dataset(per_category: int = 20, seed: int = 42) -> list[dict[str, Any]]:
-    """Generate a balanced dataset with incidents per category."""
+    """Generate a balanced synthetic dataset for evaluation.
+
+    The catalog has uneven category counts by design, so each category cycles
+    through its available templates until ``per_category`` incidents are built.
+    """
 
     rng = random.Random(seed)
-    dataset: list[dict[str, Any]] = []
-    counters = {"network": 0, "system": 0, "security": 0}
     by_category: dict[str, list[IncidentTemplate]] = {}
     for template in TEMPLATES:
         by_category.setdefault(template.category, []).append(template)
 
     base = datetime(2026, 6, 14, 1, 0, tzinfo=timezone.utc)
+    dataset: list[dict[str, Any]] = []
     for category, templates in sorted(by_category.items()):
         for index in range(per_category):
-            template = templates[index % len(templates)]
-            counters[category] += 1
             incident_number = len(dataset) + 1
-            incident = generate_incident(
-                incident_id=f"INC-{incident_number:03d}",
-                template=template,
-                base_time=base + timedelta(minutes=incident_number * 13),
-                seed=rng.randint(1, 10_000_000),
+            template = templates[index % len(templates)]
+            dataset.append(
+                generate_incident(
+                    incident_id=f"INC-{incident_number:03d}",
+                    template=template,
+                    base_time=base + timedelta(minutes=incident_number * 13),
+                    seed=rng.randint(1, 10_000_000),
+                )
             )
-            dataset.append(incident)
 
     rng.shuffle(dataset)
     return dataset

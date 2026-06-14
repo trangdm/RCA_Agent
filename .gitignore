@@ -15,5 +15,6 @@ dist/
 build/
 *.log
 data/generated/
+data/*.sqlite3
 incident.json
 assessment.json

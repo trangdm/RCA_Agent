@@ -1,32 +1,95 @@
-# AIOps Incident Investigation Agent
+# AIOps RCA Agent
 
-MVP AI agent for synthetic incident investigation on GreenNode AgentBase.
+Synthetic MVP agent for incident investigation on GreenNode AgentBase.
 
-The agent does not connect to real infrastructure. It uses generated data only:
-alerts, metrics, logs, topology, and change history.
+The agent does not connect to real ELK, Wazuh, Prometheus, Grafana, CheckMK,
+Fortigate, or VMware systems. It generates and analyzes synthetic incident data
+for demo, testing, and RCA reasoning.
 
-## MVP Capabilities
-
-- Generate synthetic incident JSON.
-- Build a sorted timeline.
-- Correlate related events into likely cause, symptom, and impact groups.
-- Analyze the most likely root cause with deterministic reasoning, with optional LLM refinement.
-- Generate safe immediate, verification, and prevention recommendations.
-- Format and optionally send a Telegram incident assessment.
-- Evaluate predictions against ground truth on a 60-incident synthetic dataset.
-
-## Architecture
+## Flow
 
 ```text
 Synthetic Incident Generator
-  -> Incident Payload
-  -> AIOps Agent
+  -> Alert + Logs + Metrics + Topology + Change History
+  -> AIOps RCA Agent
   -> Timeline Builder
-  -> Correlation Engine
-  -> Root Cause Analyzer
-  -> Recommendation Engine
-  -> Telegram Output
+  -> Event Correlation
+  -> Root Cause Analysis
+  -> Recommendation
+  -> Telegram Alert
 ```
+
+## Incident Input Contract
+
+```json
+{
+  "incident_id": "",
+  "alert": {},
+  "logs": [],
+  "metrics": [],
+  "topology": {},
+  "recent_changes": [],
+  "baseline": {},
+  "ground_truth_root_cause": ""
+}
+```
+
+`change_history` is still accepted as a backward-compatible alias for
+`recent_changes`.
+
+## Required Synthetic Scenarios
+
+The generator includes 10 MVP scenarios:
+
+1. Broadcast loop on Aruba switch
+2. MAC flapping on core switch
+3. Fortigate session spike causing high CPU
+4. DNS server timeout
+5. Linux server disk full
+6. Windows service crash
+7. VMware datastore full
+8. Interface flapping
+9. Routing issue
+10. Brute force attack detected by Wazuh
+
+Each generated incident has related logs, noise logs, before/during/after
+metrics, topology, recent changes, baseline, and ground truth.
+
+## RCA Output Contract
+
+`analyze_incident()` returns the internal RCA JSON directly:
+
+```json
+{
+  "incident_id": "",
+  "severity": "",
+  "summary": "",
+  "timeline": [
+    {
+      "time": "",
+      "event": "",
+      "source": "",
+      "type": "change|symptom|impact|evidence|root_cause_candidate"
+    }
+  ],
+  "symptoms": [],
+  "impact": "",
+  "root_cause_hypotheses": [],
+  "most_likely_root_cause": "",
+  "confidence": 0,
+  "evidence": [],
+  "recommended_actions": {
+    "immediate_actions": [],
+    "verification_actions": [],
+    "long_term_prevention": []
+  },
+  "missing_data": [],
+  "status": "need_verification|confirmed|insufficient_data"
+}
+```
+
+If confidence is below 70, the agent does not confirm a root cause and returns
+`status=insufficient_data`.
 
 ## Local Setup
 
@@ -34,15 +97,10 @@ Synthetic Incident Generator
 python -m venv venv
 venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-```
-
-Optional local config:
-
-```powershell
 Copy-Item .env.example .env
 ```
 
-For the hackathon setup, fill these values in `.env`:
+Fill `.env` with your GreenNode IAM, MaaS API key, and Telegram values:
 
 ```env
 GREENNODE_CLIENT_ID=your-iam-client-id
@@ -52,72 +110,50 @@ TELEGRAM_BOT_TOKEN=your-telegram-bot-token
 TELEGRAM_CHAT_ID=your-telegram-chat-id
 ```
 
-For MiniMax, keep:
+The deterministic RCA path works without calling the LLM. Keep
+`AIOPS_USE_LLM=false` for stable demo behavior.
 
-```env
-LLM_MODEL_PROVIDER=minimax
-LLM_MODEL=
-```
+## CLI
 
-When `LLM_MODEL` is blank, the agent calls the GreenNode MaaS `/models`
-endpoint and auto-picks a MiniMax model. Set `AIOPS_USE_LLM=true` only when you
-want LLM refinement. The offline heuristic path works with `AIOPS_USE_LLM=false`.
-
-For GreenNode MaaS / OpenAI-compatible clients:
-
-```text
-LLM_BASE_URL=https://maas-llm-aiplatform-hcm.api.vngcloud.vn/v1
-```
-
-## Generate Synthetic Dataset
+Generate a balanced dataset:
 
 ```powershell
 python scripts/generate_dataset.py --per-category 20 --output data/generated/incidents.json
 ```
 
-This creates:
-
-- `data/generated/incidents.json`
-- `incident.json` with the first generated incident
-
-## Analyze One Incident
+Analyze one incident:
 
 ```powershell
 python scripts/analyze_incident.py incident.json --output assessment.json
 ```
 
-Send Telegram report if `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set:
-
-```powershell
-python scripts/analyze_incident.py incident.json --telegram
-```
-
-## Evaluate Accuracy
+Evaluate accuracy:
 
 ```powershell
 python scripts/evaluate_dataset.py --per-category 20
 ```
 
-Target: at least 70 percent accuracy on the synthetic dataset.
-
-## AgentBase Invocation
-
-The SDK exposes the handler at `POST /invocations`.
+## AgentBase Operations
 
 Generate one incident:
 
 ```json
 {
   "operation": "generate",
-  "incident_type": "random",
-  "incident_id": "INC-DEMO"
+  "incident_type": "broadcast-loop-aruba"
 }
 ```
 
-Use a specific type by passing one of the catalog keys, for example
-`broadcast-loop`, `disk-full`, or `brute-force-attack`.
+Generate all 10 required scenarios:
 
-Analyze an incident:
+```json
+{
+  "operation": "generate",
+  "all_required_scenarios": true
+}
+```
+
+Analyze a provided incident:
 
 ```json
 {
@@ -125,37 +161,17 @@ Analyze an incident:
   "incident": {
     "incident_id": "INC-001",
     "alert": {"severity": "critical", "message": "Firewall CPU High"},
-    "metrics": [],
     "logs": [],
+    "metrics": [],
     "topology": {},
-    "change_history": []
+    "recent_changes": [],
+    "baseline": {}
   },
   "send_telegram": false
 }
 ```
 
-Evaluate generated incidents:
-
-```json
-{
-  "operation": "evaluate",
-  "per_category": 20
-}
-```
-
-Generate a random incident, analyze it, and send the Telegram alert:
-
-```json
-{
-  "operation": "demo_alert",
-  "incident_type": "random",
-  "send_telegram": true
-}
-```
-
-For a dry run that does not send Telegram, set `send_telegram` to `false`.
-
-Proactively generate, analyze, and notify a synthetic incident:
+Generate, analyze, and optionally send a Telegram alert:
 
 ```json
 {
@@ -165,113 +181,65 @@ Proactively generate, analyze, and notify a synthetic incident:
 }
 ```
 
-Record an incident reported by an operator, analyze it, and return a reply:
+Record an operator report:
 
 ```json
 {
   "operation": "record_incident",
-  "message": "Fortigate CPU high, session count spikes after a firewall policy change. Users report slow internet.",
-  "source": "FGT-HQ-01",
-  "severity": "critical",
+  "message": "camera 01 down, check port switch co bat thuong khong",
   "send_telegram": false
 }
 ```
 
-`record_incident` also accepts a full `incident` JSON payload if the caller
-already has structured alert, metric, log, topology, and change-history data.
+Get latest stored analysis:
+
+```json
+{
+  "operation": "latest"
+}
+```
+
+Send a Telegram test:
+
+```json
+{
+  "operation": "telegram_test",
+  "text": "AIOps RCA Agent Telegram test message."
+}
+```
 
 ## Telegram Chat
 
-Point the Telegram bot webhook to the AgentBase invocation endpoint:
-
-```powershell
-$endpoint = "https://<agentbase-endpoint-host>/invocations"
-$token = "<telegram-bot-token>"
-Invoke-RestMethod -Method Post `
-  -Uri "https://api.telegram.org/bot$token/setWebhook" `
-  -Body @{ url = $endpoint; drop_pending_updates = "true" }
-```
-
-After that, users can chat directly with the bot:
+Point the Telegram webhook to the AgentBase `/invocations` endpoint. Then you
+can chat naturally:
 
 ```text
-internet chậm từ 09:30-10:00, packet loss cao, user chi nhánh HCM bị ảnh hưởng
-log firewall có bandwidth saturation và qos queue full
-giả định của tôi là backup replication làm nghẽn WAN
-timeline/log đáng chú ý là gì
-có change cấu hình trong khoảng 09:30-10:00 không
-root cause hiện tại và bằng chứng là gì
+tao incident random
+internet cham tu 09:30-10:00, packet loss cao
+camera 01 down, check port switch co bat thuong khong
+mat ket noi server DB-01 sau deploy
+port ge-0/0/1 flap nhieu lan
+co change config trong khoang 09:30-10:00 khong
+timeline dang chu y la gi
+root cause hien tai va evidence la gi
+cho toi runbook/check an toan
 ```
 
-The agent keeps one active investigation session per Telegram chat. The first
-message opens an investigation; later messages are treated as added evidence,
-operator hypotheses, impact scope, suspected objects, time windows, or analyst
-questions. Each update rebuilds the synthetic incident context, checks the
-available logs/metrics/change history, rebuilds the timeline/correlation chain,
-reruns RCA, and replies in the same chat.
+The first incident-like message opens an investigation session. Follow-up
+messages add evidence, impact, suspected objects, time windows, or questions.
+The agent rebuilds the synthetic incident context and reruns RCA each turn.
 
-Mental model: the agent is expected to already have read access to system logs,
-metrics, topology, and in-change data. The operator reports symptoms or asks
-exceptions; RCA is primarily built by chaining those system events over time.
-Questions about `command`, `check`, `action`, or `runbook` are handled as
-runbook requests and return safe verification commands/checklists for the
-current root cause.
-
-Useful chat commands:
-
-```text
-/new <incident description>   start a new investigation
-/close                       close the current investigation
-tạo ra incident ngẫu nhiên    generate a standalone demo alert
-```
-
-MVP note: the agent does not connect to production systems yet. Log, metric,
-topology, and change data are synthetic or supplied by the operator in chat/API
-payloads.
-
-## Run Server Locally
+## Tests
 
 ```powershell
-python main.py
+venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Health check:
-
-```powershell
-curl.exe http://127.0.0.1:8080/health
-```
-
-## Docker
-
-```powershell
-docker build --platform linux/amd64 -t rca-agent:test .
-docker run --rm -p 8080:8080 --env-file .env rca-agent:test
-```
-
-## Project Structure
-
-```text
-aiops_incident_agent/
-  analyzer.py
-  catalog.py
-  correlation.py
-  evaluator.py
-  generator.py
-  pipeline.py
-  recommendations.py
-  telegram.py
-  timeline.py
-scripts/
-  analyze_incident.py
-  evaluate_dataset.py
-  generate_dataset.py
-tests/
-  test_mvp.py
-main.py
-Dockerfile
-```
+Current tests verify the 10 required scenarios, RCA schema, Telegram format,
+chat intake, SQLite latest storage, and at least 70 percent synthetic accuracy.
 
 ## Safety
 
-The recommendation engine avoids destructive actions such as deleting data,
-factory-resetting devices, or disabling security controls without approval.
+Recommendations are verification-first. The agent does not suggest destructive
+actions such as deleting production data, factory-resetting devices, or
+disabling security controls without validation.

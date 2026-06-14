@@ -1,21 +1,23 @@
-"""AgentBase entrypoint for the AIOps Incident Investigation Agent."""
+"""AgentBase entrypoint for the AIOps RCA Agent."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from html import escape
 import random
 import re
 import sys
+from typing import Any
 
 from dotenv import load_dotenv
 from greennode_agentbase import GreenNodeAgentBaseApp, PingStatus, RequestContext
 
-from aiops_incident_agent.evaluator import evaluate_incidents
-from aiops_incident_agent.generator import generate_dataset, generate_incident
-from aiops_incident_agent.intake import build_incident_from_report, match_report_template, normalize_text
 from aiops_incident_agent.catalog import TEMPLATES, TEMPLATES_BY_KEY, IncidentTemplate
+from aiops_incident_agent.evaluator import evaluate_incidents
+from aiops_incident_agent.generator import generate_dataset, generate_incident, generate_required_scenarios
+from aiops_incident_agent.intake import build_incident_from_report, match_report_template, normalize_text
 from aiops_incident_agent.pipeline import analyze_incident
+from aiops_incident_agent.store import latest_assessment
 from aiops_incident_agent.telegram import send_telegram_report
 
 
@@ -25,8 +27,9 @@ for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
+
 app = GreenNodeAgentBaseApp()
-INVESTIGATION_SESSIONS: dict[str, dict] = {}
+INVESTIGATION_SESSIONS: dict[str, dict[str, Any]] = {}
 INVESTIGATION_SESSION_LIMIT = 100
 
 
@@ -50,63 +53,12 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _html(value: object, default: str = "unknown") -> str:
-    if value is None or value == "":
-        return escape(default, quote=False)
-    return escape(str(value), quote=False)
-
-
-def _chat_key(chat_id: str | int | None) -> str | None:
-    if chat_id is None:
-        return None
-    return str(chat_id)
-
-
-def _template_from_payload(payload: dict) -> tuple[IncidentTemplate | None, str | None]:
-    incident_type = str(payload.get("incident_type", "random")).strip().lower()
-    if incident_type in {"", "random", "any"}:
-        rng = random.Random(int(payload["seed"])) if payload.get("seed") is not None else random.SystemRandom()
-        return rng.choice(TEMPLATES), None
-
-    template = TEMPLATES_BY_KEY.get(incident_type)
-    if template is None:
-        return None, f"Unknown incident_type: {incident_type}"
-    return template, None
-
-
-def _generate_from_payload(payload: dict, default_prefix: str = "INC-DEMO") -> dict:
-    template, error = _template_from_payload(payload)
-    if error or template is None:
-        return {"status": "error", "message": error}
-
-    seed = payload.get("seed")
-    if seed is None:
-        seed = random.SystemRandom().randint(1, 10_000_000)
-
-    incident = generate_incident(
-        incident_id=payload.get("incident_id") or _new_incident_id(default_prefix),
-        template=template,
-        seed=int(seed),
-    )
-    return {
-        "status": "success",
-        "incident_type": template.key,
-        "seed": int(seed),
-        "incident": incident,
-    }
-
-
-def _analyst_reply(incident: dict, assessment: dict) -> str:
-    root = assessment.get("root_cause_analysis", {})
-    rec = assessment.get("recommendations", {})
-    immediate = rec.get("immediate_actions", [])
-    action_text = immediate[0] if immediate else "Preserve evidence and verify the alert state"
-    return (
-        f"Đã ghi nhận {incident.get('incident_id', 'incident')}. "
-        f"Root cause khả năng cao nhất: {root.get('root_cause', 'Unknown')} "
-        f"({root.get('confidence', 0)}%). "
-        f"Hành động ưu tiên: {action_text}."
-    )
+def _html(value: object, default: str = "unknown", limit: int | None = None) -> str:
+    text = str(value if value not in {None, ""} else default)
+    text = " ".join(text.split())
+    if limit is not None and len(text) > limit:
+        text = text[: max(0, limit - 3)].rstrip() + "..."
+    return escape(text, quote=False)
 
 
 def _short_time(value: object) -> str:
@@ -119,530 +71,82 @@ def _short_time(value: object) -> str:
         return str(value)
 
 
-def _short_text(value: object, limit: int = 170) -> str:
-    text = " ".join(str(value or "").split())
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 1)].rstrip() + "..."
-
-
-def _extract_time_window(text: str) -> str | None:
-    matches = re.findall(r"\b(\d{1,2})\s*(?::|h)\s*(\d{2})\b", text.lower())
-    if len(matches) < 2:
+def _chat_key(chat_id: str | int | None) -> str | None:
+    if chat_id is None:
         return None
-    start_hour, start_minute = (int(part) for part in matches[0])
-    end_hour, end_minute = (int(part) for part in matches[1])
-    if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23 and 0 <= start_minute <= 59 and 0 <= end_minute <= 59):
-        return None
-    return f"{start_hour:02d}:{start_minute:02d}-{end_hour:02d}:{end_minute:02d}"
+    return str(chat_id)
 
 
-def _window_start(window: str) -> tuple[int, int] | None:
-    match = re.match(r"^(\d{2}):(\d{2})-", window)
-    if not match:
-        return None
-    return int(match.group(1)), int(match.group(2))
+def _template_from_payload(payload: dict[str, Any]) -> tuple[IncidentTemplate | None, str | None]:
+    incident_type = str(payload.get("incident_type", "random")).strip().lower()
+    if incident_type in {"", "random", "any"}:
+        rng = random.Random(int(payload["seed"])) if payload.get("seed") is not None else random.SystemRandom()
+        return rng.choice(TEMPLATES), None
+    template = TEMPLATES_BY_KEY.get(incident_type)
+    if template is not None:
+        return template, None
+    match = match_report_template(incident_type)
+    if int(match.get("score", 0)) > 0:
+        return match["template"], None
+    return None, f"Unknown incident_type: {incident_type}"
 
 
-def _parse_iso(value: object) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
-    except ValueError:
-        return None
+def _generate_from_payload(payload: dict[str, Any], default_prefix: str = "INC-DEMO") -> dict[str, Any]:
+    if payload.get("all_required_scenarios"):
+        return {
+            "status": "success",
+            "incidents": generate_required_scenarios(seed=int(payload.get("seed", 42))),
+        }
 
+    template, error = _template_from_payload(payload)
+    if error or template is None:
+        return {"status": "error", "message": error}
 
-def _format_iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _shift_timestamp(value: object, delta: timedelta) -> str | None:
-    parsed = _parse_iso(value)
-    if parsed is None:
-        return None
-    return _format_iso(parsed + delta)
-
-
-def _align_incident_to_window(incident: dict, window: str | None) -> None:
-    if not window:
-        return
-    start = _window_start(window)
-    if not start:
-        return
-
-    timestamps = []
-    for change in incident.get("change_history", []):
-        timestamps.append(_parse_iso(change.get("time") or change.get("timestamp")))
-    for log in incident.get("logs", []):
-        timestamps.append(_parse_iso(log.get("timestamp")))
-    for metric in incident.get("metrics", []):
-        timestamps.append(_parse_iso(metric.get("timestamp")))
-    alert = incident.get("alert") or {}
-    timestamps.append(_parse_iso(alert.get("timestamp")))
-    timestamps = [timestamp for timestamp in timestamps if timestamp is not None]
-    if not timestamps:
-        return
-
-    earliest = min(timestamps)
-    target_start = earliest.replace(hour=start[0], minute=start[1], second=0, microsecond=0)
-    delta = target_start - earliest
-
-    for change in incident.get("change_history", []):
-        key = "time" if change.get("time") else "timestamp"
-        shifted = _shift_timestamp(change.get(key), delta)
-        if shifted:
-            change[key] = shifted
-    for log in incident.get("logs", []):
-        shifted = _shift_timestamp(log.get("timestamp"), delta)
-        if shifted:
-            log["timestamp"] = shifted
-    for metric in incident.get("metrics", []):
-        shifted = _shift_timestamp(metric.get("timestamp"), delta)
-        if shifted:
-            metric["timestamp"] = shifted
-    if alert.get("timestamp"):
-        shifted = _shift_timestamp(alert.get("timestamp"), delta)
-        if shifted:
-            alert["timestamp"] = shifted
-
-
-def _extract_entities(text: str) -> list[str]:
-    patterns = [
-        r"\b(?:[A-Za-z]{2,}[-_][A-Za-z0-9_-]+)\b",
-        r"\b(?:ge|gi|xe|et)-?\d+/\d+/\d+\b",
-        r"\b\d{1,3}(?:\.\d{1,3}){3}\b",
-    ]
-    entities: list[str] = []
-    for pattern in patterns:
-        entities.extend(re.findall(pattern, text, flags=re.IGNORECASE))
-    return sorted(set(entities), key=lambda item: item.lower())[:8]
-
-
-def _observation_type(text: str) -> str:
-    normalized = normalize_text(text)
-    if any(term in normalized for term in ("gia dinh", "nghi ngo", "nghi la", "co the do", "suspect", "hypothesis")):
-        return "operator_hypothesis"
-    if any(term in normalized for term in ("log", "error", "exception", "timeout", "denied", "failed", "drop", "reset")):
-        return "operator_log"
-    if any(term in normalized for term in ("impact", "anh huong", "user", "khach hang", "khong truy cap", "mat dich vu")):
-        return "operator_impact"
-    return "operator_observation"
-
-
-def _start_new_investigation_text(text: str) -> str:
-    stripped = re.sub(
-        r"^\s*(/new|new incident|incident mới|incident moi|sự cố mới|su co moi|bắt đầu sự cố mới|bat dau su co moi)\s*[:\-]?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    ).strip()
-    return stripped or text
-
-
-def _is_new_investigation_command(text: str) -> bool:
-    normalized = normalize_text(text).strip()
-    return normalized.startswith(("su co moi", "incident moi", "/new", "new incident", "bat dau su co moi"))
-
-
-def _is_close_investigation_command(text: str) -> bool:
-    normalized = normalize_text(text).strip()
-    return normalized in {"/close", "/done", "dong su co", "ket thuc su co", "reset", "/reset"}
-
-
-def _detect_focus(text: str) -> str:
-    normalized = normalize_text(text)
-    if any(term in normalized for term in ("change", "cau hinh", "config", "ai thuc hien", "audit")):
-        return "change"
-    if any(term in normalized for term in ("timeline", "log", "event", "su kien")):
-        return "timeline"
-    if any(term in normalized for term in ("root cause", "rca", "nguyen nhan", "gia dinh", "hypothesis", "bang chung", "evidence", "tai sao")):
-        return "rca"
-    if any(
-        term in normalized
-        for term in (
-            "action",
-            "xu ly",
-            "khuyen nghi",
-            "verify",
-            "xac minh",
-            "command",
-            "cmd",
-            "cau lenh",
-            "lenh",
-            "runbook",
-            "check",
-            "kiem tra",
-        )
-    ):
-        return "runbook"
-    return "update"
-
-
-def _session_notes(session: dict) -> list[str]:
-    notes = []
-    if session.get("time_windows"):
-        notes.append("time window: " + ", ".join(session["time_windows"][-3:]))
-    if session.get("entities"):
-        notes.append("đối tượng nghi ngờ: " + ", ".join(session["entities"][-8:]))
-    if session.get("operator_hypotheses"):
-        notes.append("hypothesis operator: " + " | ".join(session["operator_hypotheses"][-2:]))
-    return notes
-
-
-def _build_session_incident(session: dict) -> dict:
-    combined = "\n".join(item["text"] for item in session["messages"])
-    payload = {
-        "message": combined,
-        "source": "telegram-chat",
-        "incident_id": session["incident_id"],
-        "seed": session["seed"],
-        "send_telegram": False,
+    seed = int(payload["seed"]) if payload.get("seed") is not None else random.SystemRandom().randint(1, 10_000_000)
+    incident = generate_incident(
+        incident_id=payload.get("incident_id") or _new_incident_id(default_prefix),
+        template=template,
+        seed=seed,
+    )
+    return {
+        "status": "success",
+        "incident_type": template.key,
+        "seed": seed,
+        "incident": incident,
     }
-    normalized = build_incident_from_report(payload)
-    incident = normalized["incident"]
-    _align_incident_to_window(incident, session["time_windows"][0] if session.get("time_windows") else None)
-    incident.setdefault("investigation_context", {})
-    incident["investigation_context"] = {
-        "message_count": len(session["messages"]),
-        "time_windows": session.get("time_windows", []),
-        "entities": session.get("entities", []),
-        "operator_hypotheses": session.get("operator_hypotheses", []),
+
+
+def _alert_from_generated(payload: dict[str, Any], default_prefix: str) -> dict[str, Any]:
+    generated = _generate_from_payload(payload, default_prefix=default_prefix)
+    if generated.get("status") != "success":
+        return generated
+    incident = generated["incident"]
+    assessment = analyze_incident(
+        incident,
+        send_telegram=_as_bool(payload.get("send_telegram"), default=True),
+        chat_id=payload.get("chat_id"),
+    )
+    return {
+        "status": "success",
+        "workflow": "proactive_alert",
+        "incident_type": generated["incident_type"],
+        "seed": generated["seed"],
+        "incident": incident,
+        "assessment": assessment,
+        "reply": _brief_reply(assessment),
     }
-    for index, message in enumerate(session["messages"], start=1):
-        incident["logs"].append(
-            {
-                "timestamp": message["timestamp"],
-                "source": "operator",
-                "event_type": message["kind"],
-                "severity": "info",
-                "message": f"Observation {index}: {_short_text(message['text'], 240)}",
-            }
-        )
-    incident["logs"] = sorted(incident["logs"], key=lambda item: item.get("timestamp", ""))
-    return {"incident": incident, "intake": normalized["intake"]}
 
 
-def _append_session_message(session: dict, text: str) -> None:
-    timestamp = _iso_now()
-    kind = _observation_type(text)
-    session["messages"].append({"timestamp": timestamp, "text": text, "kind": kind})
-    session["updated_at"] = timestamp
-
-    time_window = _extract_time_window(text)
-    if time_window and time_window not in session["time_windows"]:
-        session["time_windows"].append(time_window)
-
-    for entity in _extract_entities(text):
-        if entity not in session["entities"]:
-            session["entities"].append(entity)
-
-    if kind == "operator_hypothesis":
-        session["operator_hypotheses"].append(text)
-
-
-def _create_investigation_session(chat_id: str | int | None, text: str) -> dict:
-    session = {
-        "chat_id": _chat_key(chat_id),
-        "incident_id": _new_incident_id("INC-INV"),
-        "seed": random.SystemRandom().randint(1, 10_000_000),
-        "created_at": _iso_now(),
-        "updated_at": _iso_now(),
-        "messages": [],
-        "time_windows": [],
-        "entities": [],
-        "operator_hypotheses": [],
-    }
-    _append_session_message(session, text)
-    key = _chat_key(chat_id)
-    if key:
-        INVESTIGATION_SESSIONS[key] = session
-        while len(INVESTIGATION_SESSIONS) > INVESTIGATION_SESSION_LIMIT:
-            oldest_key = next(iter(INVESTIGATION_SESSIONS))
-            INVESTIGATION_SESSIONS.pop(oldest_key, None)
-    return session
-
-
-def _format_timeline_section(assessment: dict, limit: int = 6) -> list[str]:
-    timeline = assessment.get("timeline", [])
-    if not timeline:
-        return ["• <i>Chưa có timeline event.</i>"]
-    system_timeline = [
-        event for event in timeline if event.get("source") != "operator" and not str(event.get("event_type", "")).startswith("operator_")
-    ]
-    display_events = system_timeline or timeline
-    lines = []
-    for event in display_events[:limit]:
-        lines.append(
-            f"• <code>{_html(_short_time(event.get('timestamp')))}</code> · "
-            f"<b>{_html(event.get('event_type'))}</b> · <code>{_html(event.get('source'))}</code>"
-        )
-        if event.get("message"):
-            lines.append(f"  {_html(_short_text(event.get('message'), 150))}")
-    return lines
-
-
-def _format_change_section(incident: dict) -> list[str]:
-    changes = incident.get("change_history", [])
-    if not changes:
-        return ["• <i>Chưa thấy change/config event trong dữ liệu hiện có.</i>"]
-    lines = []
-    for change in changes[:6]:
-        lines.append(
-            f"• <code>{_html(_short_time(change.get('time') or change.get('timestamp')))}</code> · "
-            f"<code>{_html(change.get('device'))}</code> · {_html(change.get('action'))}"
-        )
-    return lines
-
-
-def _format_rca_section(assessment: dict) -> list[str]:
-    root = assessment.get("root_cause_analysis", {})
-    lines = [
-        f"Root cause hiện tại: <code>{_html(root.get('root_cause', 'Unknown'))}</code>",
-        f"Độ tin cậy: <b>{_html(root.get('confidence', 0))}%</b>",
-    ]
-    ranked = root.get("ranked_hypotheses") or []
-    if ranked:
-        lines.append("Giả định liên quan:")
-        for item in ranked[:4]:
-            evidence = ", ".join(map(str, item.get("evidence", [])[:3])) or "no strong signal"
-            lines.append(f"• {_html(item.get('root_cause'))} · score <code>{_html(item.get('score', 0))}</code> · {_html(evidence)}")
-    return lines
-
-
-def _format_action_section(assessment: dict) -> list[str]:
-    rec = assessment.get("recommendations", {})
-    actions = rec.get("immediate_actions", [])
-    if not actions:
-        actions = ["Giữ nguyên hiện trạng, đối chiếu timeline với log/metric/change đang có trước khi can thiệp"]
-    return [f"{index}. {_html(action)}" for index, action in enumerate(actions[:5], start=1)]
-
-
-def _runbook_commands(root_cause: str) -> list[str]:
-    commands_by_root = {
-        "Internet Congestion": [
-            "show interface <WAN_INTERFACE> counters",
-            "show bandwidth or traffic-monitor top-talkers",
-            "show qos queue <WAN_INTERFACE>",
-            "show current backup/replication jobs",
-            "ping <external_probe_ip> repeat 20",
-            "traceroute <external_probe_ip>",
-        ],
-        "Firewall Session Exhaustion": [
-            "diagnose sys session stat",
-            "diagnose sys top 5 20",
-            "diagnose sys session list | head",
-            "show firewall policy",
-            "show system performance status",
-        ],
-        "Interface Flapping": [
-            "show interfaces ge-0/0/1 terse",
-            "show interfaces ge-0/0/1 extensive",
-            "show log messages | match ge-0/0/1",
-            "show lacp interfaces ge-0/0/1",
-            "show ethernet-switching table interface ge-0/0/1",
-        ],
-        "DNS Failure": [
-            "dig @<dns_server> <record>",
-            "dig +trace <record>",
-            "show dns forwarding status",
-            "show log dns | tail",
-            "ping <upstream_dns>",
-        ],
-        "Service Crash": [
-            "systemctl status <service>",
-            "journalctl -u <service> --since '<incident_start>' --until '<incident_end>'",
-            "tail -n 200 /var/log/<service>.log",
-            "ss -lntp | grep <port>",
-            "curl -vk http://localhost:<port>/health",
-        ],
-        "Disk Full": [
-            "df -h",
-            "du -xhd1 /var | sort -h",
-            "journalctl --disk-usage",
-            "lsof +L1",
-            "find /var/log -type f -size +500M -ls",
-        ],
-        "CPU Exhaustion": [
-            "top -b -n1 | head -40",
-            "ps -eo pid,ppid,cmd,%cpu,%mem --sort=-%cpu | head",
-            "uptime",
-            "vmstat 1 5",
-            "journalctl --since '<incident_start>' --until '<incident_end>' | tail -200",
-        ],
-        "Memory Leak": [
-            "free -m",
-            "ps -eo pid,ppid,cmd,%mem,rss --sort=-rss | head",
-            "dmesg -T | grep -i oom",
-            "journalctl --since '<incident_start>' --until '<incident_end>' | grep -i 'oom\\|killed\\|memory'",
-        ],
-        "VMware Datastore Full": [
-            "esxcli storage filesystem list",
-            "vim-cmd vmsvc/snapshot.get <vmid>",
-            "du -h /vmfs/volumes/<datastore> | sort -h | tail",
-            "vim-cmd hostsvc/datastore/listsummary",
-        ],
-        "Brute Force Attack": [
-            "grep -i 'failed password' /var/log/auth.log | tail -100",
-            "grep -i 'authentication failed' /var/log/secure | tail -100",
-            "show vpn ssl monitor",
-            "show log auth | tail",
-        ],
-        "Port Scanning": [
-            "show log ids | match scan",
-            "show session source <suspect_ip>",
-            "tcpdump -nn host <suspect_ip> and 'tcp[tcpflags] & tcp-syn != 0'",
-            "netstat -ant | awk '{print $5}' | sort | uniq -c | sort -nr | head",
-        ],
-    }
-    return commands_by_root.get(
-        root_cause,
-        [
-            "show logs around <incident_start>-<incident_end>",
-            "show recent changes or config audit",
-            "show health/status for <suspected_object>",
-            "show metrics cpu/memory/disk/network for the affected node",
-            "run service-specific health check",
-        ],
+def _brief_reply(assessment: dict[str, Any]) -> str:
+    return (
+        f"Đã phân tích <code>{_html(assessment.get('incident_id'))}</code>. "
+        f"Root cause khả năng cao nhất: <code>{_html(assessment.get('most_likely_root_cause'))}</code> "
+        f"(<b>{int(assessment.get('confidence') or 0)}%</b>). "
+        f"Trạng thái: <code>{_html(assessment.get('status'))}</code>."
     )
 
 
-def _format_runbook_section(assessment: dict) -> list[str]:
-    root = assessment.get("root_cause_analysis", {})
-    root_cause = str(root.get("root_cause", "Unknown"))
-    lines = [
-        f"Root cause đang bám theo: <code>{_html(root_cause)}</code>",
-        "Mình sẽ dùng runbook kiểm chứng, không đưa lệnh phá hoại hay thay đổi cấu hình trực tiếp.",
-        "",
-        "Checklist nhanh:",
-    ]
-    rec = assessment.get("recommendations", {})
-    checks = rec.get("verification_actions") or []
-    if checks:
-        lines.extend(f"• {_html(item)}" for item in checks[:4])
-    else:
-        lines.extend(
-            [
-                "• Đối chiếu alert với timeline log/metric/change",
-                "• Kiểm tra object bị ảnh hưởng và upstream/downstream dependency",
-                "• Xác minh impact đã hết trước khi đóng incident",
-            ]
-        )
-
-    lines.extend(["", "Command/check gợi ý:"])
-    for command in _runbook_commands(root_cause)[:8]:
-        lines.append(f"• <code>{_html(command)}</code>")
-    return lines
-
-
-def _system_timeline(assessment: dict) -> list[dict]:
-    timeline = assessment.get("timeline", [])
-    return [
-        event for event in timeline if event.get("source") != "operator" and not str(event.get("event_type", "")).startswith("operator_")
-    ] or timeline
-
-
-def _evidence_snippets(assessment: dict, limit: int = 3) -> list[str]:
-    snippets = []
-    root = assessment.get("root_cause_analysis", {})
-    ranked = root.get("ranked_hypotheses") or []
-    for item in ranked[:1]:
-        for evidence in item.get("evidence", [])[:limit]:
-            snippets.append(str(evidence))
-    if len(snippets) < limit:
-        for event in _system_timeline(assessment):
-            event_type = str(event.get("event_type", "event"))
-            if event_type not in snippets:
-                snippets.append(event_type)
-            if len(snippets) >= limit:
-                break
-    return snippets[:limit]
-
-
-def _natural_next_question(root: dict, focus: str) -> str:
-    confidence = int(root.get("confidence", 0) or 0)
-    if root.get("needs_more_evidence") or confidence < 70:
-        return "Mình đã rà log/metric/change đang có. Nếu có ngoại lệ ngoài hệ thống giám sát, ví dụ maintenance không có ticket hoặc thao tác thủ công, bạn bổ sung để mình cập nhật giả định."
-    if focus == "change":
-        return "Change window đang là một phần chính của timeline. Bạn có thể hỏi tiếp runbook/command để mình đưa checklist kiểm chứng an toàn."
-    if focus == "runbook":
-        return "Nếu bạn muốn, hỏi tiếp theo thiết bị cụ thể như firewall, switch, Linux service hay VMware; mình sẽ bó hẹp command theo đúng nền tảng đó."
-    return "Nếu cần bước tiếp theo, bạn hỏi theo dạng runbook/check/command; còn RCA hiện tại mình sẽ tiếp tục bám theo timeline log/metric/change đã xâu chuỗi."
-
-
-def _format_investigation_reply(session: dict, incident: dict, assessment: dict, focus: str, latest_text: str) -> str:
-    root = assessment.get("root_cause_analysis", {})
-    confidence = int(root.get("confidence", 0) or 0)
-    notes = _session_notes(session)
-    root_cause = root.get("root_cause", "Unknown")
-    is_first_message = len(session["messages"]) == 1
-    evidence = _evidence_snippets(assessment)
-    incident_line = (
-        f"Mình đã tạo incident demo <code>{_html(session['incident_id'])}</code> từ mô tả của bạn và tự rà log, metric, topology cùng các change đang in-change trong bộ dữ liệu demo."
-        if is_first_message
-        else f"Mình đã thêm thông tin này vào incident <code>{_html(session['incident_id'])}</code>, tự rà lại log/change liên quan và chạy lại RCA."
-    )
-
-    if root.get("needs_more_evidence") or root_cause == "Undetermined":
-        verdict = (
-            "Hiện mình chưa chốt root cause được. Dữ liệu đang có mới đủ để dựng hướng điều tra, chưa đủ để kết luận chắc."
-        )
-    elif confidence >= 80:
-        verdict = f"Khá rõ rồi: khả năng cao là <code>{_html(root_cause)}</code> với độ tin cậy khoảng <b>{confidence}%</b>."
-    else:
-        verdict = f"Mình đang nghiêng về <code>{_html(root_cause)}</code>, nhưng độ tin cậy mới khoảng <b>{confidence}%</b> nên vẫn cần kiểm chứng thêm."
-
-    lines = [f"Ok, mình nhận rồi. {incident_line}", "", verdict]
-
-    if evidence:
-        lines.append("")
-        lines.append("Mình dựa vào mấy tín hiệu chính này trong log/metric/change:")
-        for item in evidence:
-            lines.append(f"• <code>{_html(item)}</code>")
-
-    if notes:
-        lines.append("")
-        lines.append("Context mình đang giữ trong cuộc điều tra này:")
-        lines.extend(f"• {_html(note)}" for note in notes)
-
-    if focus == "change":
-        lines.extend(["", "Mình kiểm tra phần change/config trước. Trong dữ liệu hiện tại mình thấy:"])
-        lines.extend(_format_change_section(incident))
-    elif focus == "timeline":
-        lines.extend(["", "Timeline đáng chú ý mình xâu chuỗi được là:"])
-        lines.extend(_format_timeline_section(assessment, limit=10))
-    elif focus == "rca":
-        lines.extend(["", "Nếu nhìn riêng phần RCA thì ranking hiện tại là:"])
-        lines.extend(_format_rca_section(assessment))
-    elif focus == "runbook":
-        lines.extend(["", "Phần bạn hỏi là runbook/check/action, nên mình tách ra như sau:"])
-        lines.extend(_format_runbook_section(assessment))
-    else:
-        lines.extend(["", "Timeline ngắn mình thấy như sau:"])
-        lines.extend(_format_timeline_section(assessment, limit=4))
-        lines.extend(["", "Bước đầu tiên nên làm:"])
-        lines.extend(_format_action_section(assessment)[:3])
-
-    lines.extend(["", _html(_natural_next_question(root, focus))])
-
-    text = "\n".join(lines)
-    if len(text) > 3800:
-        return text[:3790].rstrip() + "\n..."
-    return text
-
-
-def _analyze_investigation_session(session: dict, latest_text: str, focus: str) -> dict:
-    built = _build_session_incident(session)
-    incident = built["incident"]
-    assessment = analyze_incident(incident, send_telegram=False)
-    session["last_incident"] = incident
-    session["last_assessment"] = assessment
-    session["last_intake"] = built["intake"]
-    reply = _format_investigation_reply(session, incident, assessment, focus, latest_text)
-    return {"incident": incident, "assessment": assessment, "intake": built["intake"], "reply": reply}
-
-
-def _telegram_message(payload: dict) -> tuple[str | int | None, str, dict]:
+def _telegram_message(payload: dict[str, Any]) -> tuple[str | int | None, str, dict[str, Any]]:
     message = None
     for key in ("message", "edited_message", "channel_post"):
         value = payload.get(key)
@@ -654,14 +158,10 @@ def _telegram_message(payload: dict) -> tuple[str | int | None, str, dict]:
         if not message.get("text"):
             message = dict(message)
             message["text"] = payload["callback_query"].get("data", "")
-
     if not isinstance(message, dict):
         return None, "", {}
-
     chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    text = str(message.get("text") or message.get("caption") or "").strip()
-    return chat_id, text, message
+    return chat.get("id"), str(message.get("text") or message.get("caption") or "").strip(), message
 
 
 def _is_help_text(text: str) -> bool:
@@ -674,99 +174,340 @@ def _help_reply() -> str:
         [
             "🤖 <b>AIOps RCA Agent</b>",
             "",
-            "Bạn có thể mở một investigation bằng mô tả tự nhiên:",
-            "• internet chậm từ 09:30-10:00, user chi nhánh HCM bị ảnh hưởng",
-            "• mất kết nối server DB-01, nghi service crash sau deploy",
-            "• port ge-0/0/1 flap nhiều lần, có CRC error trong log",
+            "Bạn có thể mô tả sự cố tự nhiên, ví dụ:",
+            "- internet chậm từ 09:30-10:00, packet loss cao",
+            "- camera 01 down, nghi port switch bị down",
+            "- mất kết nối server DB-01 sau deploy",
+            "- port ge-0/0/1 flap nhiều lần",
             "",
-            "Sau đó cứ gửi thêm log, metric, impact, đối tượng nghi ngờ, giả định của bạn hoặc hỏi:",
-            "• timeline/log đáng chú ý là gì",
-            "• có change cấu hình trong khoảng 09:30-10:00 không",
-            "• root cause hiện tại và bằng chứng là gì",
-            "• command/check/runbook để kiểm chứng an toàn",
+            "Mình sẽ dựng incident demo liên quan, rà log/metric/topology/change synthetic, xâu chuỗi timeline, rồi trả RCA.",
+            "Hỏi tiếp bất kỳ ý nào bạn cần: change trong khoảng thời gian, evidence, timeline, hypothesis, hoặc runbook/check.",
             "",
-            "Dùng /new để bắt đầu sự cố mới, /close để đóng investigation hiện tại.",
+            "Dùng /new để bắt đầu sự cố mới, /close để đóng context hiện tại.",
         ]
     )
 
 
 def _is_random_demo_request(text: str) -> bool:
     normalized = normalize_text(text)
-    if any(term in normalized for term in ("ngau nhien", "random", "bat ky")):
-        return True
-
-    create_terms = ("tao incident", "tao su co", "sinh incident", "sinh su co", "tao alert", "demo alert")
-    if any(term in normalized for term in create_terms):
-        match = match_report_template(text)
-        return int(match.get("score", 0)) <= 0
-    return False
+    return any(term in normalized for term in ("ngau nhien", "random", "bat ky", "demo alert", "tao incident random"))
 
 
-def _handle_telegram_chat(text: str, chat_id: str | int | None = None) -> dict:
-    if not text:
+def _is_new_command(text: str) -> bool:
+    normalized = normalize_text(text)
+    return normalized.startswith(("/new", "new incident", "incident moi", "su co moi", "bat dau su co moi"))
+
+
+def _is_close_command(text: str) -> bool:
+    normalized = normalize_text(text)
+    return normalized in {"/close", "/done", "dong su co", "ket thuc su co", "reset", "/reset"}
+
+
+def _extract_time_window(text: str) -> str | None:
+    matches = re.findall(r"\b(\d{1,2})\s*(?::|h)\s*(\d{2})\b", normalize_text(text))
+    if len(matches) < 2:
+        return None
+    start_hour, start_minute = (int(part) for part in matches[0])
+    end_hour, end_minute = (int(part) for part in matches[1])
+    if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23 and 0 <= start_minute <= 59 and 0 <= end_minute <= 59):
+        return None
+    return f"{start_hour:02d}:{start_minute:02d}-{end_hour:02d}:{end_minute:02d}"
+
+
+def _extract_entities(text: str) -> list[str]:
+    patterns = [
+        r"\b[A-Za-z]{2,}[-_][A-Za-z0-9_-]+\b",
+        r"\b(?:ge|gi|xe|et)-?\d+/\d+/\d+\b",
+        r"\b\d{1,3}(?:\.\d{1,3}){3}\b",
+        r"\bcamera\s*\d+\b",
+    ]
+    entities: list[str] = []
+    for pattern in patterns:
+        entities.extend(re.findall(pattern, text, flags=re.IGNORECASE))
+    return sorted(set(entities), key=lambda item: item.lower())[:10]
+
+
+def _detect_focus(text: str) -> str:
+    normalized = normalize_text(text)
+    if any(term in normalized for term in ("command", "cmd", "runbook", "check", "kiem tra", "verify", "action")):
+        return "runbook"
+    if any(term in normalized for term in ("change", "config", "cau hinh", "audit", "ai thuc hien")):
+        return "change"
+    if any(term in normalized for term in ("timeline", "log", "event", "su kien")):
+        return "timeline"
+    if any(term in normalized for term in ("root cause", "rca", "nguyen nhan", "hypothesis", "evidence", "bang chung")):
+        return "rca"
+    return "update"
+
+
+def _session_for_message(chat_id: str | int | None, text: str) -> dict[str, Any]:
+    key = _chat_key(chat_id)
+    if key and key in INVESTIGATION_SESSIONS and not _is_new_command(text):
+        session = INVESTIGATION_SESSIONS[key]
+    else:
+        session = {
+            "chat_id": key,
+            "incident_id": _new_incident_id("INC-INV"),
+            "seed": random.SystemRandom().randint(1, 10_000_000),
+            "created_at": _iso_now(),
+            "messages": [],
+            "time_windows": [],
+            "entities": [],
+        }
+        if key:
+            INVESTIGATION_SESSIONS[key] = session
+            while len(INVESTIGATION_SESSIONS) > INVESTIGATION_SESSION_LIMIT:
+                INVESTIGATION_SESSIONS.pop(next(iter(INVESTIGATION_SESSIONS)), None)
+
+    cleaned = re.sub(r"^\s*/new\s*", "", text, flags=re.IGNORECASE).strip() or text
+    session["messages"].append({"timestamp": _iso_now(), "text": cleaned})
+    session["updated_at"] = _iso_now()
+    window = _extract_time_window(cleaned)
+    if window and window not in session["time_windows"]:
+        session["time_windows"].append(window)
+    for entity in _extract_entities(cleaned):
+        if entity not in session["entities"]:
+            session["entities"].append(entity)
+    return session
+
+
+def _build_session_incident(session: dict[str, Any]) -> dict[str, Any]:
+    combined = "\n".join(item["text"] for item in session["messages"])
+    normalized = build_incident_from_report(
+        {
+            "message": combined,
+            "source": "telegram-chat",
+            "incident_id": session["incident_id"],
+            "seed": session["seed"],
+        }
+    )
+    incident = normalized["incident"]
+    incident.setdefault("investigation_context", {})
+    incident["investigation_context"] = {
+        "message_count": len(session["messages"]),
+        "time_windows": list(session["time_windows"]),
+        "entities": list(session["entities"]),
+    }
+    for index, message in enumerate(session["messages"], start=1):
+        incident["logs"].append(
+            {
+                "timestamp": message["timestamp"],
+                "source": "operator",
+                "event_type": "operator_observation",
+                "severity": "info",
+                "message": f"Observation {index}: {message['text'][:240]}",
+                "role": "evidence",
+                "signal": "related",
+            }
+        )
+    incident["logs"] = sorted(incident["logs"], key=lambda item: item.get("timestamp", ""))
+    return {"incident": incident, "intake": normalized["intake"]}
+
+
+def _timeline_reply(assessment: dict[str, Any], limit: int = 7) -> list[str]:
+    timeline = [event for event in assessment.get("timeline", []) if event.get("signal") not in {"noise", "baseline"}]
+    if not timeline:
+        return ["- Chưa có timeline event đủ tin cậy."]
+    lines = []
+    for event in timeline[:limit]:
+        lines.append(
+            f"- <code>{_html(_short_time(event.get('time')))}</code> "
+            f"[{_html(event.get('type'))}] <code>{_html(event.get('source'))}</code>: "
+            f"{_html(event.get('event'), limit=150)}"
+        )
+    return lines
+
+
+def _change_reply(incident: dict[str, Any]) -> list[str]:
+    changes = incident.get("recent_changes") or incident.get("change_history") or []
+    if not changes:
+        return ["- Chưa thấy change/config event trong dữ liệu hiện có."]
+    return [
+        f"- <code>{_html(_short_time(change.get('time') or change.get('timestamp')))}</code> "
+        f"<code>{_html(change.get('device'))}</code>: {_html(change.get('action'), limit=180)}"
+        for change in changes[:8]
+    ]
+
+
+def _runbook_commands(root_cause: str) -> list[str]:
+    commands = {
+        "Broadcast Loop on Aruba switch": [
+            "show spanning-tree vlan <vlan>",
+            "show mac-address-table move",
+            "show interface 1/1/48 counters",
+            "show running-config interface 1/1/48",
+        ],
+        "MAC flapping on core switch": [
+            "show ethernet-switching table | match <mac>",
+            "show lacp interfaces ae1",
+            "show log messages | match MAC",
+        ],
+        "Fortigate session spike causing high CPU": [
+            "diagnose sys session stat",
+            "diagnose sys top 5 20",
+            "diagnose sys session list | head",
+            "show firewall policy",
+        ],
+        "DNS server timeout": [
+            "dig @<dns_server> <record>",
+            "dig +trace <record>",
+            "ping <upstream_dns>",
+            "journalctl -u named --since '<incident_start>'",
+        ],
+        "Linux server disk full": [
+            "df -h",
+            "du -xhd1 /var | sort -h",
+            "journalctl --disk-usage",
+            "lsof +L1",
+        ],
+        "Windows service crash": [
+            "Get-Service <service>",
+            "Get-EventLog -LogName Application -Newest 100",
+            "Get-WinEvent -FilterHashtable @{LogName='System'; StartTime='<incident_start>'}",
+        ],
+        "VMware datastore full": [
+            "vim-cmd hostsvc/datastore/listsummary",
+            "vim-cmd vmsvc/snapshot.get <vmid>",
+            "esxcli storage filesystem list",
+        ],
+        "Interface flapping": [
+            "show interfaces ge-0/0/1 terse",
+            "show interfaces ge-0/0/1 extensive",
+            "show log messages | match ge-0/0/1",
+            "show lacp interfaces ge-0/0/1",
+        ],
+        "Routing issue": [
+            "show route <prefix>",
+            "show bgp summary",
+            "show route advertising-protocol bgp <peer>",
+            "show configuration policy-options",
+        ],
+        "Brute force attack detected by Wazuh": [
+            "grep -i 'failed password' /var/log/auth.log | tail -100",
+            "show vpn ssl monitor",
+            "show log auth | tail",
+            "wazuh-logtest",
+        ],
+    }
+    return commands.get(
+        root_cause,
+        [
+            "show logs around <incident_start>-<incident_end>",
+            "show recent changes or config audit",
+            "show health/status for <suspected_object>",
+            "show metrics for affected node",
+        ],
+    )
+
+
+def _format_chat_reply(session: dict[str, Any], incident: dict[str, Any], assessment: dict[str, Any], focus: str) -> str:
+    first_turn = len(session["messages"]) == 1
+    root = assessment.get("most_likely_root_cause", "Undetermined")
+    confidence = int(assessment.get("confidence") or 0)
+    status = assessment.get("status")
+
+    if first_turn:
+        opening = (
+            f"Ok, mình đã tạo incident demo <code>{_html(session['incident_id'])}</code> từ mô tả của bạn "
+            "và rà synthetic log/metric/topology/change liên quan."
+        )
+    else:
+        opening = (
+            f"Mình đã thêm thông tin mới vào incident <code>{_html(session['incident_id'])}</code> "
+            "và chạy lại RCA theo toàn bộ context hiện có."
+        )
+
+    if root == "Undetermined" or confidence < 70:
+        verdict = (
+            f"Hiện chưa đủ dữ liệu để chốt root cause. Candidate mạnh nhất đang ở mức <b>{confidence}%</b>, "
+            "nên mình giữ trạng thái <code>insufficient_data</code>."
+        )
+    else:
+        verdict = (
+            f"Root cause khả năng cao nhất là <code>{_html(root)}</code> với độ tin cậy <b>{confidence}%</b>. "
+            f"Trạng thái: <code>{_html(status)}</code>."
+        )
+
+    lines = [opening, "", verdict, "", "<b>Evidence chính:</b>"]
+    evidence = assessment.get("evidence") or []
+    if evidence:
+        lines.extend(f"- {_html(item, limit=180)}" for item in evidence[:5])
+    else:
+        lines.append("- Chưa có evidence đủ mạnh trong payload.")
+
+    if session.get("time_windows") or session.get("entities"):
+        lines.append("")
+        lines.append("<b>Context mình đang giữ:</b>")
+        if session.get("time_windows"):
+            lines.append(f"- Time window: {_html(', '.join(session['time_windows']))}")
+        if session.get("entities"):
+            lines.append(f"- Object nghi ngờ: {_html(', '.join(session['entities']))}")
+
+    if focus == "change":
+        lines.extend(["", "<b>Change/config trong dữ liệu:</b>"])
+        lines.extend(_change_reply(incident))
+    elif focus == "timeline":
+        lines.extend(["", "<b>Timeline đáng chú ý:</b>"])
+        lines.extend(_timeline_reply(assessment, limit=10))
+    elif focus == "rca":
+        lines.extend(["", "<b>Root cause candidates:</b>"])
+        for item in assessment.get("root_cause_hypotheses", [])[:5]:
+            lines.append(f"- {_html(item.get('hypothesis'))}: <b>{int(item.get('confidence') or 0)}%</b>")
+    elif focus == "runbook":
+        lines.extend(["", "<b>Runbook/check an toàn:</b>"])
+        for command in _runbook_commands(str(root))[:8]:
+            lines.append(f"- <code>{_html(command)}</code>")
+    else:
+        lines.extend(["", "<b>Timeline ngắn:</b>"])
+        lines.extend(_timeline_reply(assessment, limit=5))
+        lines.extend(["", "<b>Bước nên làm ngay:</b>"])
+        actions = assessment.get("recommended_actions", {}).get("immediate_actions", [])
+        lines.extend(f"{index}. {_html(action, limit=160)}" for index, action in enumerate(actions[:3], start=1))
+
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        return text[:3890].rstrip() + "\n..."
+    return text
+
+
+def _handle_telegram_chat(text: str, chat_id: str | int | None = None) -> dict[str, Any]:
+    if not text or _is_help_text(text):
         reply = _help_reply()
         delivery = send_telegram_report(reply, chat_id=chat_id) if chat_id is not None else {"sent": False}
         return {"status": "success", "workflow": "telegram_chat", "intent": "help", "reply": reply, "telegram_delivery": delivery}
 
-    if _is_help_text(text):
-        reply = _help_reply()
+    if _is_close_command(text):
+        key = _chat_key(chat_id)
+        if key:
+            INVESTIGATION_SESSIONS.pop(key, None)
+        reply = "✅ <b>Đã đóng investigation hiện tại.</b>\nGửi mô tả mới khi bạn muốn bắt đầu RCA tiếp."
         delivery = send_telegram_report(reply, chat_id=chat_id) if chat_id is not None else {"sent": False}
-        return {"status": "success", "workflow": "telegram_chat", "intent": "help", "reply": reply, "telegram_delivery": delivery}
+        return {"status": "success", "workflow": "telegram_chat", "intent": "close_investigation", "reply": reply, "telegram_delivery": delivery}
 
     if _is_random_demo_request(text):
         result = _alert_from_generated(
-            {"incident_type": "random", "send_telegram": False},
+            {"incident_type": "random", "send_telegram": False, "chat_id": chat_id},
             default_prefix="INC-TELEGRAM-DEMO",
         )
         result["workflow"] = "telegram_chat"
         result["intent"] = "proactive_alert"
-        result["chat_text"] = text
         delivery = send_telegram_report(result["assessment"]["telegram_report"], chat_id=chat_id) if chat_id is not None else {"sent": False}
         result["telegram_delivery"] = delivery
         return result
 
-    key = _chat_key(chat_id)
-    if _is_close_investigation_command(text):
-        if key:
-            INVESTIGATION_SESSIONS.pop(key, None)
-        reply = "✅ <b>Đã đóng investigation hiện tại.</b>\nGửi mô tả sự cố mới khi bạn muốn bắt đầu phân tích tiếp."
-        delivery = send_telegram_report(reply, chat_id=chat_id) if chat_id is not None else {"sent": False}
-        return {"status": "success", "workflow": "telegram_chat", "intent": "close_investigation", "reply": reply, "telegram_delivery": delivery}
-
-    if key and key in INVESTIGATION_SESSIONS and not _is_new_investigation_command(text):
-        session = INVESTIGATION_SESSIONS[key]
-        _append_session_message(session, text)
-        focus = _detect_focus(text)
-        result = _analyze_investigation_session(session, latest_text=text, focus=focus)
-        delivery = send_telegram_report(result["reply"], chat_id=chat_id) if chat_id is not None else {"sent": False}
-        return {
-            "status": "success",
-            "workflow": "telegram_chat",
-            "intent": "continue_investigation",
-            "chat_text": text,
-            "session": {
-                "incident_id": session["incident_id"],
-                "message_count": len(session["messages"]),
-                "time_windows": session["time_windows"],
-                "entities": session["entities"],
-            },
-            "intake": result["intake"],
-            "incident": result["incident"],
-            "assessment": result["assessment"],
-            "reply": result["reply"],
-            "telegram_delivery": delivery,
-        }
-
-    initial_text = _start_new_investigation_text(text) if _is_new_investigation_command(text) else text
-    session = _create_investigation_session(chat_id, initial_text)
-    result = _analyze_investigation_session(session, latest_text=initial_text, focus=_detect_focus(initial_text))
-    incident = result["incident"]
-    assessment = result["assessment"]
-    delivery = send_telegram_report(result["reply"], chat_id=chat_id) if chat_id is not None else {"sent": False}
+    session = _session_for_message(chat_id, text)
+    built = _build_session_incident(session)
+    incident = built["incident"]
+    assessment = analyze_incident(incident, send_telegram=False)
+    session["last_incident"] = incident
+    session["last_assessment"] = assessment
+    focus = _detect_focus(text)
+    reply = _format_chat_reply(session, incident, assessment, focus)
+    delivery = send_telegram_report(reply, chat_id=chat_id) if chat_id is not None else {"sent": False}
     return {
         "status": "success",
         "workflow": "telegram_chat",
-        "intent": "start_investigation",
+        "intent": "start_investigation" if len(session["messages"]) == 1 else "continue_investigation",
         "chat_text": text,
         "session": {
             "incident_id": session["incident_id"],
@@ -774,73 +515,33 @@ def _handle_telegram_chat(text: str, chat_id: str | int | None = None) -> dict:
             "time_windows": session["time_windows"],
             "entities": session["entities"],
         },
-        "intake": result["intake"],
+        "intake": built["intake"],
         "incident": incident,
         "assessment": assessment,
-        "reply": result["reply"],
+        "reply": reply,
         "telegram_delivery": delivery,
     }
 
 
-def _alert_from_generated(payload: dict, default_prefix: str) -> dict:
-    generated = _generate_from_payload(payload, default_prefix=default_prefix)
-    if generated.get("status") != "success":
-        return generated
-    incident = generated["incident"]
-    assessment = analyze_incident(
-        incident,
-        send_telegram=_as_bool(payload.get("send_telegram"), default=True),
-    )
-    return {
-        "status": "success",
-        "workflow": "proactive_alert",
-        "incident_type": generated["incident_type"],
-        "seed": generated["seed"],
-        "incident": incident,
-        "assessment": assessment,
-        "reply": _analyst_reply(incident, assessment),
-    }
-
-
 @app.entrypoint
-def handler(payload: dict, context: RequestContext) -> dict:
-    """Handle AgentBase POST /invocations requests.
+def handler(payload: dict[str, Any], context: RequestContext | None) -> dict[str, Any]:
+    """Handle AgentBase POST /invocations requests."""
 
-    Supported operations:
-    - analyze: analyze a provided incident JSON.
-    - generate: generate one synthetic incident.
-    - proactive_alert: generate/analyze/notify a synthetic incident.
-    - record_incident: normalize a user report, analyze it, and respond.
-    - telegram_chat: handle Telegram-style chat text or webhook updates.
-    - evaluate: generate/evaluate a synthetic dataset, or evaluate provided incidents.
-    """
-
+    payload = payload or {}
     if "operation" not in payload:
         chat_id, text, message = _telegram_message(payload)
         if message:
             return _handle_telegram_chat(text, chat_id=chat_id)
 
-    operation = payload.get("operation", "analyze")
+    operation = str(payload.get("operation", "analyze")).lower()
 
-    if operation == "generate":
+    if operation in {"generate", "demo/incidents/generate", "incidents_generate"}:
         return _generate_from_payload(payload)
 
-    if operation == "demo_alert":
-        return _alert_from_generated(payload, default_prefix="INC-DEMO-ALERT")
-
-    if operation in {"proactive_alert", "proactive_check"}:
+    if operation in {"demo_alert", "proactive_alert", "proactive_check"}:
         return _alert_from_generated(payload, default_prefix="INC-PROACTIVE")
 
-    if operation == "evaluate":
-        incidents = payload.get("incidents")
-        if incidents is None:
-            incidents = generate_dataset(
-                per_category=int(payload.get("per_category", 20)),
-                seed=int(payload.get("seed", 42)),
-            )
-        return {"status": "success", "evaluation": evaluate_incidents(incidents)}
-
-    if operation == "analyze":
+    if operation in {"analyze", "incidents/analyze", "incidents_analyze"}:
         incident = payload.get("incident")
         if incident is None:
             return {"status": "error", "message": "Missing required field: incident"}
@@ -849,19 +550,27 @@ def handler(payload: dict, context: RequestContext) -> dict:
             "assessment": analyze_incident(
                 incident,
                 send_telegram=_as_bool(payload.get("send_telegram"), default=False),
+                chat_id=payload.get("chat_id"),
             ),
         }
+
+    if operation in {"latest", "incidents/latest", "incidents_latest"}:
+        return {"status": "success", "latest": latest_assessment()}
+
+    if operation in {"telegram_test", "telegram/test"}:
+        text = payload.get("text") or "AIOps RCA Agent Telegram test message."
+        return {"status": "success", "telegram_delivery": send_telegram_report(str(text), chat_id=payload.get("chat_id"))}
 
     if operation in {"record_incident", "submit_incident", "user_report", "triage_incident"}:
         try:
             normalized = build_incident_from_report(payload)
         except ValueError as exc:
             return {"status": "error", "message": str(exc)}
-
         incident = normalized["incident"]
         assessment = analyze_incident(
             incident,
             send_telegram=_as_bool(payload.get("send_telegram"), default=False),
+            chat_id=payload.get("chat_id"),
         )
         return {
             "status": "success",
@@ -869,7 +578,7 @@ def handler(payload: dict, context: RequestContext) -> dict:
             "intake": normalized["intake"],
             "incident": incident,
             "assessment": assessment,
-            "reply": _analyst_reply(incident, assessment),
+            "reply": _brief_reply(assessment),
         }
 
     if operation in {"telegram_chat", "chat"}:
@@ -878,6 +587,15 @@ def handler(payload: dict, context: RequestContext) -> dict:
         if isinstance(text, dict):
             chat_id, text, _ = _telegram_message(payload)
         return _handle_telegram_chat(str(text), chat_id=chat_id)
+
+    if operation == "evaluate":
+        incidents = payload.get("incidents")
+        if incidents is None:
+            incidents = generate_dataset(per_category=int(payload.get("per_category", 20)), seed=int(payload.get("seed", 42)))
+        return {"status": "success", "evaluation": evaluate_incidents(incidents)}
+
+    if operation == "health":
+        return {"status": "ok"}
 
     return {"status": "error", "message": f"Unsupported operation: {operation}"}
 

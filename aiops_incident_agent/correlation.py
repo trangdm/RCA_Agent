@@ -5,26 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 
-CAUSE_HINTS = {
-    "change",
-    "root_bridge_change",
-    "bpdu_guard_disabled",
-    "prefix_denied",
-    "new_nat_policy_hit",
-    "forwarder_unreachable",
-    "snapshot_growth",
-    "suspicious_process",
-    "credential_reuse",
-}
-
-IMPACT_HINTS = {
-    "alert",
-    "user_impact",
-    "service_availability",
-    "vm_stun",
-    "account_lockout",
-    "ha_vm_restart",
-}
+def _related_events(timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [event for event in timeline if event.get("signal") not in {"noise", "baseline"}]
 
 
 def correlate_events(timeline: list[dict[str, Any]]) -> dict[str, Any]:
@@ -33,35 +15,38 @@ def correlate_events(timeline: list[dict[str, Any]]) -> dict[str, Any]:
     if not timeline:
         return {"event_cluster": [], "causality_graph": []}
 
-    causes = []
-    symptoms = []
-    impacts = []
+    related = _related_events(timeline)
+    if not related:
+        related = timeline
 
-    for event in timeline:
-        event_type = event.get("event_type", "")
-        category = event.get("category", "")
-        if category == "change" or event_type in CAUSE_HINTS:
-            causes.append(event["event_id"])
-        elif category == "alert" or event_type in IMPACT_HINTS or "impact" in event.get("message", "").lower():
-            impacts.append(event["event_id"])
-        else:
-            symptoms.append(event["event_id"])
+    causes = [event["event_id"] for event in related if event.get("type") in {"change", "root_cause_candidate"}]
+    symptoms = [event["event_id"] for event in related if event.get("type") == "symptom"]
+    impacts = [event["event_id"] for event in related if event.get("type") == "impact"]
+    evidence = [event["event_id"] for event in related if event.get("type") == "evidence"]
 
     cluster = {
         "cluster_id": "cluster-001",
         "theme": "primary_incident_chain",
-        "related_event_ids": [event["event_id"] for event in timeline],
+        "related_event_ids": [event["event_id"] for event in related],
         "candidate_causes": causes,
         "symptoms": symptoms,
+        "evidence": evidence,
         "impacts": impacts,
-        "correlation_reason": "Events are correlated by close timestamps, shared topology, and matching operational signals.",
+        "correlation_reason": (
+            "Events are correlated by close timestamps, shared topology, recent changes, "
+            "and matching operational signals. Noise and baseline events are retained in "
+            "the timeline but not promoted into the primary incident chain."
+        ),
     }
 
     graph = []
     for cause in causes:
-        for symptom in symptoms[:6]:
+        for symptom in symptoms[:8]:
             graph.append({"from": cause, "to": symptom, "relationship": "possible_cause_of"})
-    for symptom in symptoms[:6]:
+    for evidence_id in evidence[:8]:
+        for symptom in symptoms[:4]:
+            graph.append({"from": evidence_id, "to": symptom, "relationship": "supports"})
+    for symptom in symptoms[:8]:
         for impact in impacts:
             graph.append({"from": symptom, "to": impact, "relationship": "contributes_to"})
 

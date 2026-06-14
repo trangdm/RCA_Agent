@@ -1,218 +1,122 @@
 from datetime import datetime
 import os
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-os.environ["AIOPS_USE_LLM"] = "false"
 
+os.environ["AIOPS_USE_LLM"] = "false"
+os.environ["AIOPS_STORE_PATH"] = "data/test_incidents.sqlite3"
+
+from aiops_incident_agent.catalog import REQUIRED_SCENARIO_KEYS
 from aiops_incident_agent.evaluator import evaluate_incidents
-from aiops_incident_agent.generator import generate_dataset
+from aiops_incident_agent.generator import generate_dataset, generate_required_scenarios
+from aiops_incident_agent.intake import build_incident_from_report
 from aiops_incident_agent.pipeline import analyze_incident
 from aiops_incident_agent.telegram import format_telegram_payload
 from aiops_incident_agent.timeline import build_timeline
 from main import INVESTIGATION_SESSIONS, handler
 
 
-class AIOpsMVPTest(unittest.TestCase):
+STORE_PATH = Path(os.environ["AIOPS_STORE_PATH"])
+
+
+class AIOpsRCARebuildTest(unittest.TestCase):
     def setUp(self):
         INVESTIGATION_SESSIONS.clear()
+        if STORE_PATH.exists():
+            STORE_PATH.unlink()
 
-    def test_generate_balanced_dataset(self):
-        incidents = generate_dataset(per_category=20, seed=123)
-        self.assertEqual(len(incidents), 60)
-        counts = {"network": 0, "system": 0, "security": 0}
+    def test_required_scenarios_are_generated(self):
+        incidents = generate_required_scenarios(seed=123)
+        self.assertEqual(len(incidents), 10)
+        self.assertEqual({incident["scenario_key"] for incident in incidents}, set(REQUIRED_SCENARIO_KEYS))
         for incident in incidents:
-            counts[incident["category"]] += 1
             self.assertIn("ground_truth_root_cause", incident)
             self.assertIn("alert", incident)
-            self.assertIn("metrics", incident)
             self.assertIn("logs", incident)
+            self.assertIn("metrics", incident)
             self.assertIn("topology", incident)
-            self.assertIn("change_history", incident)
-        self.assertEqual(counts, {"network": 20, "system": 20, "security": 20})
+            self.assertIn("recent_changes", incident)
+            self.assertIn("baseline", incident)
+            self.assertTrue(any(log.get("signal") == "related" for log in incident["logs"]))
+            self.assertTrue(any(log.get("signal") == "noise" for log in incident["logs"]))
+            self.assertEqual({"before", "during", "after"}, {metric.get("phase") for metric in incident["metrics"]})
 
-    def test_timeline_is_sorted(self):
-        incident = generate_dataset(per_category=1, seed=321)[0]
+    def test_timeline_schema_and_sorting(self):
+        incident = generate_required_scenarios(seed=321)[0]
         timeline = build_timeline(incident)
-        parsed = [datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")) for event in timeline]
+        parsed = [datetime.fromisoformat(event["time"].replace("Z", "+00:00")) for event in timeline]
         self.assertEqual(parsed, sorted(parsed))
+        for event in timeline:
+            self.assertIn("time", event)
+            self.assertIn("event", event)
+            self.assertIn("source", event)
+            self.assertIn(event["type"], {"change", "symptom", "impact", "evidence", "root_cause_candidate"})
 
-    def test_analyze_single_incident(self):
-        incident = generate_dataset(per_category=1, seed=42)[0]
-        assessment = analyze_incident(incident)
-        self.assertIn("timeline", assessment)
-        self.assertIn("correlation", assessment)
-        self.assertIn("root_cause_analysis", assessment)
-        self.assertIn("recommendations", assessment)
-        self.assertIn("telegram_report", assessment)
-        self.assertEqual(assessment["root_cause_analysis"]["root_cause"], incident["ground_truth_root_cause"])
-        self.assertIn("<b>AIOps Incident Assessment</b>", assessment["telegram_report"])
-        self.assertIn("<code>", assessment["telegram_report"])
-        self.assertEqual(format_telegram_payload(assessment["telegram_report"])["parse_mode"], "HTML")
+    def test_each_required_scenario_analyzes_to_ground_truth(self):
+        incidents = generate_required_scenarios(seed=42)
+        for incident in incidents:
+            with self.subTest(incident=incident["scenario_key"]):
+                assessment = analyze_incident(incident, persist=False)
+                self.assertEqual(assessment["most_likely_root_cause"], incident["ground_truth_root_cause"])
+                self.assertGreaterEqual(assessment["confidence"], 70)
+                self.assertIn(assessment["status"], {"need_verification", "confirmed"})
+                self.assertIn("summary", assessment)
+                self.assertIn("timeline", assessment)
+                self.assertIn("root_cause_hypotheses", assessment)
+                self.assertIn("recommended_actions", assessment)
+                self.assertIn("telegram_report", assessment)
+                self.assertIn("<b>AIOps RCA Alert</b>", assessment["telegram_report"])
+                self.assertEqual(format_telegram_payload(assessment["telegram_report"])["parse_mode"], "HTML")
 
-    def test_accuracy_threshold(self):
+    def test_dataset_accuracy_threshold(self):
         incidents = generate_dataset(per_category=20, seed=42)
         evaluation = evaluate_incidents(incidents)
+        self.assertEqual(evaluation["total"], 60)
         self.assertGreaterEqual(evaluation["accuracy"], 0.70)
 
-    def test_agentbase_generate_random_incident(self):
-        response = handler({"operation": "generate", "incident_type": "random", "seed": 2609}, None)
-        self.assertEqual(response["status"], "success")
-        self.assertIn("incident_type", response)
-        self.assertIn("ground_truth_root_cause", response["incident"])
+    def test_manual_vague_report_is_insufficient_data(self):
+        normalized = build_incident_from_report({"message": "please check this issue", "severity": "warning"})
+        assessment = analyze_incident(normalized["incident"], persist=False)
+        self.assertEqual(assessment["most_likely_root_cause"], "Undetermined")
+        self.assertEqual(assessment["status"], "insufficient_data")
+        self.assertLess(assessment["confidence"], 70)
 
-    def test_agentbase_demo_alert_without_telegram(self):
-        response = handler(
-            {"operation": "demo_alert", "incident_type": "random", "seed": 2610, "send_telegram": False},
-            None,
-        )
-        self.assertEqual(response["status"], "success")
-        self.assertIn("incident", response)
-        self.assertIn("assessment", response)
-        self.assertNotIn("telegram_delivery", response["assessment"])
+    def test_handler_generate_analyze_latest(self):
+        generated = handler({"operation": "generate", "incident_type": "broadcast-loop-aruba", "seed": 2609}, None)
+        self.assertEqual(generated["status"], "success")
+        incident = generated["incident"]
+        analyzed = handler({"operation": "analyze", "incident": incident, "send_telegram": False}, None)
+        self.assertEqual(analyzed["status"], "success")
+        self.assertEqual(analyzed["assessment"]["most_likely_root_cause"], incident["ground_truth_root_cause"])
+        latest = handler({"operation": "latest"}, None)
+        self.assertTrue(latest["latest"]["found"])
+        self.assertEqual(latest["latest"]["assessment"]["incident_id"], incident["incident_id"])
 
-    def test_agentbase_proactive_alert_without_telegram(self):
-        response = handler(
-            {"operation": "proactive_alert", "incident_type": "random", "seed": 2613, "send_telegram": False},
-            None,
-        )
+    def test_handler_generate_all_required_scenarios(self):
+        response = handler({"operation": "generate", "all_required_scenarios": True, "seed": 123}, None)
         self.assertEqual(response["status"], "success")
-        self.assertEqual(response["workflow"], "proactive_alert")
-        self.assertIn("reply", response)
-        self.assertNotIn("telegram_delivery", response["assessment"])
+        self.assertEqual(len(response["incidents"]), 10)
 
-    def test_agentbase_record_incident_from_message(self):
-        response = handler(
-            {
-                "operation": "record_incident",
-                "message": "Fortigate CPU high and session spike after firewall policy change",
-                "source": "FGT-HQ-01",
-                "severity": "critical",
-                "send_telegram": False,
-            },
-            None,
-        )
-        self.assertEqual(response["status"], "success")
-        self.assertEqual(response["workflow"], "record_incident")
-        self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Firewall Session Exhaustion")
-        self.assertIn("reply", response)
-
-    def test_agentbase_record_incident_undetermined_when_too_vague(self):
-        response = handler(
-            {"operation": "record_incident", "message": "Need someone to look at this", "send_telegram": False},
-            None,
-        )
-        self.assertEqual(response["status"], "success")
-        self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Undetermined")
-        self.assertTrue(response["assessment"]["root_cause_analysis"]["needs_more_evidence"])
-
-    def test_telegram_chat_random_incident_request(self):
-        update = {
-            "update_id": 1,
-            "message": {"message_id": 1, "chat": {"id": 12345}, "text": "tạo ra incident ngẫu nhiên"},
-        }
+    def test_telegram_random_demo_request(self):
         with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
-            response = handler(update, None)
+            response = handler({"operation": "telegram_chat", "chat_id": 12345, "text": "tao incident random"}, None)
         self.assertEqual(response["status"], "success")
-        self.assertEqual(response["workflow"], "telegram_chat")
         self.assertEqual(response["intent"], "proactive_alert")
         self.assertIn("assessment", response)
+        self.assertIn("AIOps RCA Alert", response["assessment"]["telegram_report"])
 
-    def test_telegram_chat_internet_slow_maps_to_congestion(self):
+    def test_telegram_chat_camera_down_maps_to_interface_flapping(self):
         with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
-            response = handler(
-                {
-                    "operation": "telegram_chat",
-                    "chat_id": 12345,
-                    "text": "internet chậm kết nối hãy kiểm tra có gì bất thường hay không",
-                },
-                None,
-        )
-        self.assertEqual(response["intent"], "start_investigation")
-        self.assertEqual(response["intake"]["matched_template"], "internet-congestion")
-        self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Internet Congestion")
-        self.assertIn("tạo incident demo", response["reply"])
-        self.assertIn("Khá rõ rồi", response["reply"])
-
-    def test_telegram_chat_db_disconnect_maps_to_service_crash(self):
-        with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
-            response = handler(
-                {
-                    "operation": "telegram_chat",
-                    "chat_id": 12346,
-                    "text": "mất kết nối server DB-01 có gì bất thường không",
-                },
-                None,
-            )
-        self.assertEqual(response["intent"], "start_investigation")
-        self.assertEqual(response["intake"]["matched_template"], "service-crash")
-        self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Service Crash")
-
-    def test_telegram_chat_port_flap_maps_to_interface_flapping(self):
-        with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
-            response = handler(
-                {
-                    "operation": "telegram_chat",
-                    "chat_id": 12347,
-                    "text": "port ge-0/0/1 bị flap nhiều lần có ghi nhận gì bất thường không",
-                },
-                None,
-            )
+            response = handler({"operation": "telegram_chat", "chat_id": 456, "text": "camera 01 down, check port switch co bat thuong khong"}, None)
+            follow_up = handler({"operation": "telegram_chat", "chat_id": 456, "text": "co change config trong khoang 09:30-10:00 khong"}, None)
         self.assertEqual(response["intent"], "start_investigation")
         self.assertEqual(response["intake"]["matched_template"], "interface-flapping")
-        self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Interface Flapping")
-
-    def test_telegram_multi_turn_investigation_accumulates_context(self):
-        chat_id = 77701
-        with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
-            first = handler(
-                {
-                    "operation": "telegram_chat",
-                    "chat_id": chat_id,
-                    "text": "internet chậm từ 09:30-10:00, packet loss cao, user chi nhánh HCM bị ảnh hưởng",
-                },
-                None,
-            )
-            second = handler(
-                {
-                    "operation": "telegram_chat",
-                    "chat_id": chat_id,
-                    "text": "log firewall có bandwidth saturation và qos queue full; giả định của tôi là backup replication làm nghẽn WAN",
-                },
-                None,
-            )
-            question = handler(
-                {
-                    "operation": "telegram_chat",
-                    "chat_id": chat_id,
-                    "text": "timeline/log đáng chú ý là gì",
-                },
-                None,
-            )
-            runbook = handler(
-                {
-                    "operation": "telegram_chat",
-                    "chat_id": chat_id,
-                    "text": "cho tôi command/check runbook để verify sự cố này",
-                },
-                None,
-            )
-
-        self.assertEqual(first["intent"], "start_investigation")
-        self.assertEqual(second["intent"], "continue_investigation")
-        self.assertEqual(second["session"]["message_count"], 2)
-        self.assertIn("09:30-10:00", second["session"]["time_windows"])
-        self.assertEqual(second["assessment"]["root_cause_analysis"]["root_cause"], "Internet Congestion")
-        self.assertIn("chạy lại RCA", second["reply"])
-        self.assertIn("Mình dựa vào", second["reply"])
-        self.assertIn("09:30:00 UTC", second["reply"])
-        self.assertEqual(question["intent"], "continue_investigation")
-        self.assertIn("Timeline đáng chú ý", question["reply"])
-        self.assertEqual(runbook["intent"], "continue_investigation")
-        self.assertIn("runbook/check/action", runbook["reply"])
-        self.assertIn("Command/check gợi ý", runbook["reply"])
-        self.assertIn("show interface", runbook["reply"])
-        self.assertNotIn("Bạn gửi thêm giúp mình log raw", runbook["reply"])
+        self.assertEqual(response["assessment"]["most_likely_root_cause"], "Interface flapping")
+        self.assertIn("incident demo", response["reply"])
+        self.assertEqual(follow_up["intent"], "continue_investigation")
+        self.assertIn("Change/config", follow_up["reply"])
 
 
 if __name__ == "__main__":

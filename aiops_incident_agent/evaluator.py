@@ -14,8 +14,8 @@ def evaluate_incidents(incidents: list[dict[str, Any]]) -> dict[str, Any]:
     by_category: dict[str, Counter[str]] = {}
 
     for incident in incidents:
-        assessment = analyze_incident(incident)
-        predicted = assessment["root_cause_analysis"]["root_cause"]
+        assessment = analyze_incident(incident, persist=False)
+        predicted = assessment.get("most_likely_root_cause") or assessment["root_cause_analysis"]["root_cause"]
         expected = incident.get("ground_truth_root_cause")
         is_correct = predicted == expected
         correct += int(is_correct)
@@ -29,7 +29,7 @@ def evaluate_incidents(incidents: list[dict[str, Any]]) -> dict[str, Any]:
                 "category": category,
                 "expected": expected,
                 "predicted": predicted,
-                "confidence": assessment["root_cause_analysis"]["confidence"],
+                "confidence": assessment.get("confidence", assessment["root_cause_analysis"]["confidence"]),
                 "correct": is_correct,
             }
         )

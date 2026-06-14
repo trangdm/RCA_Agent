@@ -8,149 +8,130 @@ import os
 from typing import Any
 
 
+ALERT_ICON = "\U0001f6a8"
+RED = "\U0001f534"
+ORANGE = "\U0001f7e0"
+YELLOW = "\U0001f7e1"
+GREEN = "\U0001f7e2"
+WHITE = "\u26aa"
+
+
 def _is_placeholder(value: str | None) -> bool:
     return not value or value.strip().upper().startswith("REPLACE_ME")
 
 
-def _safe(value: Any, default: str = "unknown") -> str:
+def _safe(value: Any, default: str = "unknown", limit: int | None = None) -> str:
     if value is None or value == "":
-        return escape(default)
-    return escape(str(value), quote=False)
-
-
-def _severity_badge(severity: str) -> str:
-    normalized = severity.lower()
-    if normalized == "critical":
-        return "🔴 <b>CRITICAL</b>"
-    if normalized in {"high", "major"}:
-        return "🟠 <b>HIGH</b>"
-    if normalized in {"warning", "medium"}:
-        return "🟡 <b>WARNING</b>"
-    if normalized in {"low", "info", "informational"}:
-        return "🟢 <b>INFO</b>"
-    return f"⚪ <b>{_safe(severity).upper()}</b>"
-
-
-def _confidence_badge(confidence: Any) -> str:
-    try:
-        value = int(confidence)
-    except (TypeError, ValueError):
-        value = 0
-
-    if value >= 85:
-        label = "🟢 High"
-    elif value >= 70:
-        label = "🟡 Medium"
+        text = default
     else:
-        label = "🟠 Low"
-    return f"{label} · <b>{value}%</b>"
+        text = " ".join(str(value).split())
+    if limit is not None and len(text) > limit:
+        text = text[: max(0, limit - 3)].rstrip() + "..."
+    return escape(text, quote=False)
+
+
+def _severity_badge(severity: Any) -> str:
+    normalized = str(severity or "").lower()
+    if normalized == "critical":
+        return f"{RED} <b>CRITICAL</b>"
+    if normalized in {"major", "high"}:
+        return f"{ORANGE} <b>MAJOR</b>"
+    if normalized in {"warning", "medium"}:
+        return f"{YELLOW} <b>WARNING</b>"
+    if normalized in {"low", "info", "informational"}:
+        return f"{GREEN} <b>INFO</b>"
+    return f"{WHITE} <b>{_safe(severity).upper()}</b>"
 
 
 def _short_time(value: Any) -> str:
     if not value:
         return "unknown"
     try:
-        normalized = str(value).replace("Z", "+00:00")
-        parsed = datetime.fromisoformat(normalized).astimezone(timezone.utc)
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
         return parsed.strftime("%H:%M:%S UTC")
     except ValueError:
         return str(value)
 
 
-def _item_lines(items: list[Any], limit: int, icon: str) -> list[str]:
+def _numbered(items: list[Any], limit: int, empty: str) -> list[str]:
     if not items:
-        return [f"{icon} <i>No data available</i>"]
-    return [f"{icon} {_safe(item)}" for item in items[:limit]]
+        return [f"1. <i>{_safe(empty)}</i>"]
+    return [f"{index}. {_safe(item, limit=180)}" for index, item in enumerate(items[:limit], start=1)]
 
 
-def _numbered_lines(items: list[Any], limit: int) -> list[str]:
+def _dash(items: list[Any], limit: int, empty: str) -> list[str]:
     if not items:
-        return ["1. <i>No data available</i>"]
-    return [f"{index}. {_safe(item)}" for index, item in enumerate(items[:limit], start=1)]
+        return [f"- <i>{_safe(empty)}</i>"]
+    return [f"- {_safe(item, limit=180)}" for item in items[:limit]]
 
 
-def _collect_evidence(root: dict[str, Any], timeline: list[dict[str, Any]]) -> list[str]:
-    evidence: list[str] = []
-    for item in root.get("ranked_hypotheses", [])[:1]:
-        evidence.extend(item.get("evidence", []))
-    if evidence:
-        return sorted(set(str(item) for item in evidence))
-    return [event.get("event_type", "event") for event in timeline[:5]]
-
-
-def _timeline_lines(timeline: list[dict[str, Any]], limit: int = 6) -> list[str]:
-    if not timeline:
-        return ["• <i>No timeline events available</i>"]
+def _timeline_lines(timeline: list[dict[str, Any]], limit: int = 7) -> list[str]:
+    useful = [event for event in timeline if event.get("signal") not in {"noise", "baseline"}]
+    if not useful:
+        useful = timeline
+    if not useful:
+        return ["- <i>No timeline data available</i>"]
 
     lines = []
-    for event in timeline[:limit]:
-        timestamp = _safe(_short_time(event.get("timestamp")))
-        event_type = _safe(event.get("event_type", "event"))
+    for event in useful[:limit]:
+        event_type = _safe(event.get("type", "event"))
+        time = _safe(_short_time(event.get("time") or event.get("timestamp")))
         source = _safe(event.get("source", "unknown"))
-        message = _safe(event.get("message", ""))
-        lines.append(f"• <code>{timestamp}</code> · <b>{event_type}</b> · <code>{source}</code>")
-        if message:
-            lines.append(f"  {message}")
+        message = _safe(event.get("event") or event.get("message"), limit=150)
+        lines.append(f"- <code>{time}</code> [{event_type}] <code>{source}</code>: {message}")
+    if len(useful) > limit:
+        lines.append(f"- ... {len(useful) - limit} more related events kept in JSON timeline")
     return lines
 
 
 def format_telegram_report(assessment: dict[str, Any]) -> str:
-    root = assessment.get("root_cause_analysis", {})
-    rec = assessment.get("recommendations", {})
-    timeline = assessment.get("timeline", [])
-    evidence = _collect_evidence(root, timeline)
-    severity = assessment.get("severity", "unknown")
-    method = root.get("method", "heuristic")
-    model = root.get("llm_model", "")
+    rec = assessment.get("recommended_actions") or assessment.get("recommendations") or {}
+    hypotheses = assessment.get("root_cause_hypotheses") or []
+    confidence = int(assessment.get("confidence") or 0)
+    status = assessment.get("status", "need_verification")
 
     lines = [
-        "🚨 <b>AIOps Incident Assessment</b>",
-        f"{_severity_badge(str(severity))} · <code>{_safe(assessment.get('incident_id', 'unknown'))}</code>",
-        f"Category: <b>{_safe(assessment.get('category', 'unknown')).title()}</b>",
+        f"{ALERT_ICON} <b>AIOps RCA Alert</b>",
         "",
-        "🎯 <b>Most Likely Root Cause</b>",
-        f"<code>{_safe(root.get('root_cause', 'Unknown'))}</code>",
-        f"Confidence: {_confidence_badge(root.get('confidence', 0))}",
-        f"Method: <code>{_safe(method)}</code>" + (f" · Model: <code>{_safe(model)}</code>" if model else ""),
+        f"<b>Incident ID:</b> <code>{_safe(assessment.get('incident_id', 'unknown'))}</code>",
+        f"<b>Severity:</b> {_severity_badge(assessment.get('severity', 'unknown'))}",
         "",
-        "🧾 <b>Evidence</b>",
+        "<b>Summary:</b>",
+        _safe(assessment.get("summary", "No summary available."), limit=700),
+        "",
+        "<b>Most Likely Root Cause:</b>",
+        f"<code>{_safe(assessment.get('most_likely_root_cause', 'Undetermined'), limit=220)}</code>",
+        "",
+        "<b>Confidence:</b>",
+        f"<b>{confidence}%</b>",
+        "",
+        "<b>Evidence:</b>",
     ]
-    lines.extend(_item_lines(evidence, limit=8, icon="•"))
-    lines.extend(
-        [
-            "",
-            "🕒 <b>Timeline</b>",
-        ]
-    )
-    lines.extend(_timeline_lines(timeline))
-    lines.extend(
-        [
-            "",
-            "⚡ <b>Immediate Actions</b>",
-        ]
-    )
-    lines.extend(_numbered_lines(rec.get("immediate_actions", []), limit=5))
-    lines.extend(
-        [
-            "",
-            "✅ <b>Verification</b>",
-        ]
-    )
-    lines.extend(_item_lines(rec.get("verification_actions", []), limit=4, icon="•"))
-    lines.extend(
-        [
-            "",
-            "🛡️ <b>Long-term Prevention</b>",
-        ]
-    )
-    lines.extend(_item_lines(rec.get("long_term_prevention", []), limit=3, icon="•"))
-    lines.extend(
-        [
-            "",
-            f"Status: <b>{_safe(assessment.get('status', 'Need verification'))}</b>",
-        ]
-    )
-    return "\n".join(lines)
+    lines.extend(_numbered(list(assessment.get("evidence") or []), limit=6, empty="No concrete evidence yet"))
+
+    if hypotheses:
+        lines.extend(["", "<b>Root Cause Candidates:</b>"])
+        for index, hypothesis in enumerate(hypotheses[:3], start=1):
+            lines.append(
+                f"{index}. {_safe(hypothesis.get('hypothesis'), limit=120)} "
+                f"(<b>{int(hypothesis.get('confidence') or 0)}%</b>)"
+            )
+
+    lines.extend(["", "<b>Timeline:</b>"])
+    lines.extend(_timeline_lines(list(assessment.get("timeline") or [])))
+    lines.extend(["", "<b>Impact:</b>", _safe(assessment.get("impact", "No explicit impact data."), limit=450)])
+    lines.extend(["", "<b>Recommended Actions:</b>"])
+    lines.extend(_numbered(list(rec.get("immediate_actions") or []), limit=4, empty="Preserve evidence and verify the alert state"))
+    lines.extend(["", "<b>Verification Steps:</b>"])
+    lines.extend(_dash(list(rec.get("verification_actions") or []), limit=5, empty="Collect more evidence before confirmation"))
+    lines.extend(["", "<b>Missing Data:</b>"])
+    lines.extend(_dash(list(assessment.get("missing_data") or []), limit=5, empty="No missing data listed"))
+    lines.extend(["", "<b>Status:</b>", f"<code>{_safe(status)}</code>"])
+
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        return text[:3890].rstrip() + "\n..."
+    return text
 
 
 def format_telegram_payload(text: str) -> dict[str, Any]:
