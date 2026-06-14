@@ -14,7 +14,12 @@ from aiops_incident_agent.generator import generate_dataset, generate_incident
 from aiops_incident_agent.intake import build_incident_from_report, match_report_template, normalize_text
 from aiops_incident_agent.catalog import TEMPLATES, TEMPLATES_BY_KEY, IncidentTemplate
 from aiops_incident_agent.pipeline import analyze_incident
-from aiops_incident_agent.telegram import send_telegram_report
+from aiops_incident_agent.telegram import (
+    answer_callback_query,
+    format_telegram_detail,
+    send_telegram_report,
+    telegram_action_keyboard,
+)
 
 
 load_dotenv()
@@ -24,6 +29,8 @@ for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
 app = GreenNodeAgentBaseApp()
+RECENT_ASSESSMENTS: dict[str, dict] = {}
+RECENT_ASSESSMENT_LIMIT = 100
 
 
 def _as_bool(value: object, default: bool = False) -> bool:
@@ -89,6 +96,25 @@ def _analyst_reply(incident: dict, assessment: dict) -> str:
     )
 
 
+def _cache_assessment(assessment: dict) -> None:
+    incident_id = assessment.get("incident_id")
+    if not incident_id:
+        return
+    RECENT_ASSESSMENTS[str(incident_id)] = assessment
+    while len(RECENT_ASSESSMENTS) > RECENT_ASSESSMENT_LIMIT:
+        oldest_key = next(iter(RECENT_ASSESSMENTS))
+        RECENT_ASSESSMENTS.pop(oldest_key, None)
+
+
+def _send_assessment(chat_id: str | int | None, assessment: dict) -> dict:
+    _cache_assessment(assessment)
+    return send_telegram_report(
+        assessment["telegram_report"],
+        chat_id=chat_id,
+        reply_markup=telegram_action_keyboard(assessment.get("incident_id")),
+    )
+
+
 def _telegram_message(payload: dict) -> tuple[str | int | None, str, dict]:
     message = None
     for key in ("message", "edited_message", "channel_post"):
@@ -109,6 +135,47 @@ def _telegram_message(payload: dict) -> tuple[str | int | None, str, dict]:
     chat_id = chat.get("id")
     text = str(message.get("text") or message.get("caption") or "").strip()
     return chat_id, text, message
+
+
+def _handle_telegram_callback(callback_query: dict) -> dict:
+    callback_id = callback_query.get("id")
+    data = str(callback_query.get("data") or "")
+    message = callback_query.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+
+    if not data.startswith("rca:"):
+        ack = answer_callback_query(callback_id, "Unknown action")
+        return {"status": "success", "workflow": "telegram_callback", "telegram_ack": ack}
+
+    _, section, incident_id = data.split(":", 2)
+    assessment = RECENT_ASSESSMENTS.get(incident_id)
+    if not assessment:
+        text = (
+            "⚠️ <b>Details expired</b>\n"
+            "Cache chi tiết của incident này không còn trong runtime. "
+            "Hãy gửi lại câu hỏi hoặc tạo incident demo mới."
+        )
+        delivery = send_telegram_report(text, chat_id=chat_id)
+        ack = answer_callback_query(callback_id, "Details expired")
+        return {
+            "status": "success",
+            "workflow": "telegram_callback",
+            "incident_id": incident_id,
+            "telegram_delivery": delivery,
+            "telegram_ack": ack,
+        }
+
+    detail_text = format_telegram_detail(assessment, section)
+    delivery = send_telegram_report(detail_text, chat_id=chat_id)
+    ack = answer_callback_query(callback_id, "Sent details")
+    return {
+        "status": "success",
+        "workflow": "telegram_callback",
+        "incident_id": incident_id,
+        "section": section,
+        "telegram_delivery": delivery,
+        "telegram_ack": ack,
+    }
 
 
 def _is_help_text(text: str) -> bool:
@@ -163,7 +230,7 @@ def _handle_telegram_chat(text: str, chat_id: str | int | None = None) -> dict:
         result["workflow"] = "telegram_chat"
         result["intent"] = "proactive_alert"
         result["chat_text"] = text
-        delivery = send_telegram_report(result["assessment"]["telegram_report"], chat_id=chat_id) if chat_id is not None else {"sent": False}
+        delivery = _send_assessment(chat_id, result["assessment"]) if chat_id is not None else {"sent": False}
         result["telegram_delivery"] = delivery
         return result
 
@@ -176,7 +243,7 @@ def _handle_telegram_chat(text: str, chat_id: str | int | None = None) -> dict:
     )
     incident = normalized["incident"]
     assessment = analyze_incident(incident, send_telegram=False)
-    delivery = send_telegram_report(assessment["telegram_report"], chat_id=chat_id) if chat_id is not None else {"sent": False}
+    delivery = _send_assessment(chat_id, assessment) if chat_id is not None else {"sent": False}
     return {
         "status": "success",
         "workflow": "telegram_chat",
@@ -224,6 +291,8 @@ def handler(payload: dict, context: RequestContext) -> dict:
     """
 
     if "operation" not in payload:
+        if isinstance(payload.get("callback_query"), dict):
+            return _handle_telegram_callback(payload["callback_query"])
         chat_id, text, message = _telegram_message(payload)
         if message:
             return _handle_telegram_chat(text, chat_id=chat_id)

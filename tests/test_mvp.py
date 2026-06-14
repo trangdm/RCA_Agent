@@ -8,7 +8,7 @@ os.environ["AIOPS_USE_LLM"] = "false"
 from aiops_incident_agent.evaluator import evaluate_incidents
 from aiops_incident_agent.generator import generate_dataset
 from aiops_incident_agent.pipeline import analyze_incident
-from aiops_incident_agent.telegram import format_telegram_payload
+from aiops_incident_agent.telegram import format_telegram_payload, telegram_action_keyboard
 from aiops_incident_agent.timeline import build_timeline
 from main import handler
 
@@ -43,9 +43,16 @@ class AIOpsMVPTest(unittest.TestCase):
         self.assertIn("recommendations", assessment)
         self.assertIn("telegram_report", assessment)
         self.assertEqual(assessment["root_cause_analysis"]["root_cause"], incident["ground_truth_root_cause"])
+        self.assertIn("hypothesis_summary", assessment["root_cause_analysis"])
         self.assertIn("<b>AIOps Incident Assessment</b>", assessment["telegram_report"])
+        self.assertIn("<b>Hypotheses</b>", assessment["telegram_report"])
         self.assertIn("<code>", assessment["telegram_report"])
         self.assertEqual(format_telegram_payload(assessment["telegram_report"])["parse_mode"], "HTML")
+        payload = format_telegram_payload(
+            assessment["telegram_report"],
+            reply_markup=telegram_action_keyboard(assessment["incident_id"]),
+        )
+        self.assertIn("reply_markup", payload)
 
     def test_accuracy_threshold(self):
         incidents = generate_dataset(per_category=20, seed=42)
@@ -114,6 +121,7 @@ class AIOpsMVPTest(unittest.TestCase):
         self.assertEqual(response["workflow"], "telegram_chat")
         self.assertEqual(response["intent"], "proactive_alert")
         self.assertIn("assessment", response)
+        self.assertEqual(response["telegram_delivery"]["sent"], True)
 
     def test_telegram_chat_internet_slow_maps_to_congestion(self):
         with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
@@ -154,6 +162,32 @@ class AIOpsMVPTest(unittest.TestCase):
             )
         self.assertEqual(response["intake"]["matched_template"], "interface-flapping")
         self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Interface Flapping")
+
+    def test_telegram_callback_returns_cached_detail(self):
+        update = {
+            "update_id": 2,
+            "message": {"message_id": 1, "chat": {"id": 12345}, "text": "port ge-0/0/1 bi flap nhieu lan"},
+        }
+        with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
+            response = handler(update, None)
+
+        incident_id = response["assessment"]["incident_id"]
+        callback = {
+            "update_id": 3,
+            "callback_query": {
+                "id": "cb-001",
+                "data": f"rca:tl:{incident_id}",
+                "message": {"message_id": 2, "chat": {"id": 12345}},
+            },
+        }
+        with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}), patch(
+            "main.answer_callback_query", return_value={"sent": True, "status_code": 200}
+        ):
+            detail = handler(callback, None)
+
+        self.assertEqual(detail["workflow"], "telegram_callback")
+        self.assertEqual(detail["section"], "tl")
+        self.assertEqual(detail["telegram_delivery"]["sent"], True)
 
 
 if __name__ == "__main__":

@@ -57,6 +57,13 @@ def _short_time(value: Any) -> str:
         return str(value)
 
 
+def _short_text(value: Any, limit: int = 96) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "..."
+
+
 def _item_lines(items: list[Any], limit: int, icon: str) -> list[str]:
     if not items:
         return [f"{icon} <i>No data available</i>"]
@@ -87,10 +94,25 @@ def _timeline_lines(timeline: list[dict[str, Any]], limit: int = 6) -> list[str]
         timestamp = _safe(_short_time(event.get("timestamp")))
         event_type = _safe(event.get("event_type", "event"))
         source = _safe(event.get("source", "unknown"))
-        message = _safe(event.get("message", ""))
+        message = _safe(_short_text(event.get("message", ""), 110))
         lines.append(f"• <code>{timestamp}</code> · <b>{event_type}</b> · <code>{source}</code>")
         if message:
             lines.append(f"  {message}")
+    return lines
+
+
+def _hypothesis_lines(root: dict[str, Any], limit: int = 3) -> list[str]:
+    hypotheses = root.get("hypothesis_summary") or []
+    if not hypotheses:
+        return ["• <i>No hypothesis ranking available</i>"]
+
+    lines = []
+    for index, item in enumerate(hypotheses[:limit], start=1):
+        cause = _safe(item.get("root_cause", "Unknown"))
+        probability = _safe(item.get("probability", 0))
+        evidence = item.get("evidence") or []
+        evidence_text = f" · {_safe(', '.join(map(str, evidence[:2])))}" if evidence else ""
+        lines.append(f"{index}. <b>{cause}</b> · <code>{probability}%</code>{evidence_text}")
     return lines
 
 
@@ -98,72 +120,154 @@ def format_telegram_report(assessment: dict[str, Any]) -> str:
     root = assessment.get("root_cause_analysis", {})
     rec = assessment.get("recommendations", {})
     timeline = assessment.get("timeline", [])
-    evidence = _collect_evidence(root, timeline)
     severity = assessment.get("severity", "unknown")
     method = root.get("method", "heuristic")
     model = root.get("llm_model", "")
+    immediate = rec.get("immediate_actions", [])
 
     lines = [
         "🚨 <b>AIOps Incident Assessment</b>",
         f"{_severity_badge(str(severity))} · <code>{_safe(assessment.get('incident_id', 'unknown'))}</code>",
         f"Category: <b>{_safe(assessment.get('category', 'unknown')).title()}</b>",
         "",
-        "🎯 <b>Most Likely Root Cause</b>",
-        f"<code>{_safe(root.get('root_cause', 'Unknown'))}</code>",
+        "🎯 <b>RCA Summary</b>",
+        f"Most likely: <code>{_safe(root.get('root_cause', 'Unknown'))}</code>",
         f"Confidence: {_confidence_badge(root.get('confidence', 0))}",
-        f"Method: <code>{_safe(method)}</code>" + (f" · Model: <code>{_safe(model)}</code>" if model else ""),
         "",
-        "🧾 <b>Evidence</b>",
+        "🧠 <b>Hypotheses</b>",
     ]
-    lines.extend(_item_lines(evidence, limit=8, icon="•"))
+    lines.extend(_hypothesis_lines(root, limit=3))
     lines.extend(
         [
             "",
-            "🕒 <b>Timeline</b>",
+            "🕒 <b>Timeline Snapshot</b>",
         ]
     )
-    lines.extend(_timeline_lines(timeline))
+    lines.extend(_timeline_lines(timeline, limit=4))
     lines.extend(
         [
             "",
-            "⚡ <b>Immediate Actions</b>",
+            "⚡ <b>Next Action</b>",
         ]
     )
-    lines.extend(_numbered_lines(rec.get("immediate_actions", []), limit=5))
+    lines.append(f"1. {_safe(immediate[0] if immediate else 'Preserve evidence and verify alert state')}")
     lines.extend(
         [
             "",
-            "✅ <b>Verification</b>",
-        ]
-    )
-    lines.extend(_item_lines(rec.get("verification_actions", []), limit=4, icon="•"))
-    lines.extend(
-        [
-            "",
-            "🛡️ <b>Long-term Prevention</b>",
-        ]
-    )
-    lines.extend(_item_lines(rec.get("long_term_prevention", []), limit=3, icon="•"))
-    lines.extend(
-        [
-            "",
+            f"Method: <code>{_safe(method)}</code>" + (f" · Model: <code>{_safe(model)}</code>" if model else ""),
             f"Status: <b>{_safe(assessment.get('status', 'Need verification'))}</b>",
+            "",
+            "<i>Use the buttons below for full timeline, evidence, and actions.</i>",
         ]
     )
     return "\n".join(lines)
 
 
-def format_telegram_payload(text: str) -> dict[str, Any]:
+def format_telegram_timeline_detail(assessment: dict[str, Any]) -> str:
+    lines = [
+        "🕒 <b>Incident Timeline</b>",
+        f"Incident: <code>{_safe(assessment.get('incident_id', 'unknown'))}</code>",
+        "",
+    ]
+    lines.extend(_timeline_lines(assessment.get("timeline", []), limit=12))
+    return "\n".join(lines)
+
+
+def format_telegram_evidence_detail(assessment: dict[str, Any]) -> str:
+    root = assessment.get("root_cause_analysis", {})
+    timeline = assessment.get("timeline", [])
+    evidence = _collect_evidence(root, timeline)
+    lines = [
+        "🧾 <b>Evidence Detail</b>",
+        f"Incident: <code>{_safe(assessment.get('incident_id', 'unknown'))}</code>",
+        "",
+        "🧠 <b>Hypothesis Ranking</b>",
+    ]
+    lines.extend(_hypothesis_lines(root, limit=5))
+    lines.extend(["", "Signals:"])
+    lines.extend(_item_lines(evidence, limit=12, icon="•"))
+    if root.get("evidence"):
+        lines.extend(["", "LLM Evidence:"])
+        lines.extend(_item_lines(root.get("evidence", []), limit=8, icon="•"))
+    return "\n".join(lines)
+
+
+def format_telegram_actions_detail(assessment: dict[str, Any]) -> str:
+    rec = assessment.get("recommendations", {})
+    lines = [
+        "⚡ <b>Recommended Actions</b>",
+        f"Incident: <code>{_safe(assessment.get('incident_id', 'unknown'))}</code>",
+        "",
+        "Immediate:",
+    ]
+    lines.extend(_numbered_lines(rec.get("immediate_actions", []), limit=6))
+    lines.extend(["", "Verification:"])
+    lines.extend(_item_lines(rec.get("verification_actions", []), limit=6, icon="•"))
+    lines.extend(["", "Long-term Prevention:"])
+    lines.extend(_item_lines(rec.get("long_term_prevention", []), limit=6, icon="•"))
+    return "\n".join(lines)
+
+
+def format_telegram_full_detail(assessment: dict[str, Any]) -> str:
+    parts = [
+        format_telegram_evidence_detail(assessment),
+        "",
+        format_telegram_timeline_detail(assessment),
+        "",
+        format_telegram_actions_detail(assessment),
+    ]
+    text = "\n".join(parts)
+    if len(text) > 3800:
+        return text[:3790].rstrip() + "\n..."
+    return text
+
+
+def format_telegram_detail(assessment: dict[str, Any], section: str) -> str:
+    if section == "tl":
+        return format_telegram_timeline_detail(assessment)
+    if section == "ev":
+        return format_telegram_evidence_detail(assessment)
+    if section == "ac":
+        return format_telegram_actions_detail(assessment)
+    return format_telegram_full_detail(assessment)
+
+
+def telegram_action_keyboard(incident_id: str | None) -> dict[str, Any] | None:
+    if not incident_id:
+        return None
+    safe_id = str(incident_id)[:48]
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Timeline", "callback_data": f"rca:tl:{safe_id}"},
+                {"text": "Evidence", "callback_data": f"rca:ev:{safe_id}"},
+            ],
+            [
+                {"text": "Actions", "callback_data": f"rca:ac:{safe_id}"},
+                {"text": "Full", "callback_data": f"rca:full:{safe_id}"},
+            ],
+        ]
+    }
+
+
+def format_telegram_payload(text: str, reply_markup: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build the Telegram API payload for rich HTML rendering."""
 
-    return {
+    payload = {
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return payload
 
 
-def send_telegram_report(text: str, chat_id: str | int | None = None) -> dict[str, Any]:
+def send_telegram_report(
+    text: str,
+    chat_id: str | int | None = None,
+    reply_markup: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     target_chat_id = str(chat_id) if chat_id is not None else os.getenv("TELEGRAM_CHAT_ID")
     if _is_placeholder(token) or _is_placeholder(target_chat_id):
@@ -172,11 +276,29 @@ def send_telegram_report(text: str, chat_id: str | int | None = None) -> dict[st
     try:
         import requests
 
-        payload = format_telegram_payload(text)
+        payload = format_telegram_payload(text, reply_markup=reply_markup)
         payload["chat_id"] = target_chat_id
         response = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json=payload,
+            timeout=10,
+        )
+        return {"sent": response.ok, "status_code": response.status_code, "response": response.text[:500]}
+    except Exception as exc:  # pragma: no cover - network defensive path
+        return {"sent": False, "reason": str(exc)}
+
+
+def answer_callback_query(callback_query_id: str | None, text: str = "") -> dict[str, Any]:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if _is_placeholder(token) or not callback_query_id:
+        return {"sent": False, "reason": "TELEGRAM_BOT_TOKEN or callback_query_id is not configured"}
+
+    try:
+        import requests
+
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text[:180]},
             timeout=10,
         )
         return {"sent": response.ok, "status_code": response.status_code, "response": response.text[:500]}

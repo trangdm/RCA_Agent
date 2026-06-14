@@ -79,6 +79,58 @@ def heuristic_root_cause(incident: dict[str, Any], timeline: list[dict[str, Any]
     }
 
 
+def _with_hypothesis_probabilities(result: dict[str, Any]) -> dict[str, Any]:
+    """Add a compact probability view for operator-facing summaries."""
+
+    ranked = list(result.get("ranked_hypotheses") or [])[:5]
+    root_cause = result.get("root_cause", "Unknown")
+    try:
+        confidence = int(result.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0
+    confidence = max(0, min(99, confidence))
+
+    summary = []
+    root_present = False
+    for item in ranked:
+        if item.get("root_cause") == root_cause:
+            root_present = True
+            break
+
+    if root_cause and root_cause != "Undetermined" and not root_present:
+        summary.append(
+            {
+                "root_cause": root_cause,
+                "probability": confidence,
+                "evidence": result.get("evidence", [])[:3],
+            }
+        )
+
+    other_items = [item for item in ranked if item.get("root_cause") != root_cause]
+    other_score_total = sum(max(0, int(item.get("score", 0))) for item in other_items)
+    remaining = max(0, 100 - confidence)
+
+    for item in ranked:
+        score = max(0, int(item.get("score", 0)))
+        if item.get("root_cause") == root_cause:
+            probability = confidence
+        elif other_score_total > 0:
+            probability = round(remaining * score / other_score_total)
+        else:
+            probability = 0
+        summary.append(
+            {
+                "root_cause": item.get("root_cause", "Unknown"),
+                "probability": probability,
+                "evidence": item.get("evidence", [])[:3],
+            }
+        )
+
+    result = dict(result)
+    result["hypothesis_summary"] = summary[:5]
+    return result
+
+
 def _is_placeholder(value: str | None) -> bool:
     return not value or value.strip().upper().startswith("REPLACE_ME")
 
@@ -231,4 +283,5 @@ def llm_refine_root_cause(
 
 def analyze_root_cause(incident: dict[str, Any], timeline: list[dict[str, Any]]) -> dict[str, Any]:
     heuristic = heuristic_root_cause(incident, timeline)
-    return llm_refine_root_cause(incident, timeline, heuristic)
+    refined = llm_refine_root_cause(incident, timeline, heuristic)
+    return _with_hypothesis_probabilities(refined)
