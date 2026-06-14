@@ -60,6 +60,14 @@ def heuristic_root_cause(incident: dict[str, Any], timeline: list[dict[str, Any]
     text = _incident_text(incident, timeline)
     ranked = _score_templates(text)
     top = ranked[0]
+    if top["score"] <= 0:
+        return {
+            "root_cause": "Undetermined",
+            "confidence": 35,
+            "method": "heuristic",
+            "ranked_hypotheses": ranked[:5],
+            "needs_more_evidence": True,
+        }
     second = ranked[1] if len(ranked) > 1 else {"score": 0}
     margin = max(0, top["score"] - second["score"])
     confidence = min(95, max(45, 55 + margin * 2 + min(top["score"], 50) // 2))

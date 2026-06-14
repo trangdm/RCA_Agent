@@ -11,6 +11,7 @@ from greennode_agentbase import GreenNodeAgentBaseApp, PingStatus, RequestContex
 
 from aiops_incident_agent.evaluator import evaluate_incidents
 from aiops_incident_agent.generator import generate_dataset, generate_incident
+from aiops_incident_agent.intake import build_incident_from_report
 from aiops_incident_agent.catalog import TEMPLATES, TEMPLATES_BY_KEY, IncidentTemplate
 from aiops_incident_agent.pipeline import analyze_incident
 
@@ -74,6 +75,39 @@ def _generate_from_payload(payload: dict, default_prefix: str = "INC-DEMO") -> d
     }
 
 
+def _analyst_reply(incident: dict, assessment: dict) -> str:
+    root = assessment.get("root_cause_analysis", {})
+    rec = assessment.get("recommendations", {})
+    immediate = rec.get("immediate_actions", [])
+    action_text = immediate[0] if immediate else "Preserve evidence and verify the alert state"
+    return (
+        f"Đã ghi nhận {incident.get('incident_id', 'incident')}. "
+        f"Root cause khả năng cao nhất: {root.get('root_cause', 'Unknown')} "
+        f"({root.get('confidence', 0)}%). "
+        f"Hành động ưu tiên: {action_text}."
+    )
+
+
+def _alert_from_generated(payload: dict, default_prefix: str) -> dict:
+    generated = _generate_from_payload(payload, default_prefix=default_prefix)
+    if generated.get("status") != "success":
+        return generated
+    incident = generated["incident"]
+    assessment = analyze_incident(
+        incident,
+        send_telegram=_as_bool(payload.get("send_telegram"), default=True),
+    )
+    return {
+        "status": "success",
+        "workflow": "proactive_alert",
+        "incident_type": generated["incident_type"],
+        "seed": generated["seed"],
+        "incident": incident,
+        "assessment": assessment,
+        "reply": _analyst_reply(incident, assessment),
+    }
+
+
 @app.entrypoint
 def handler(payload: dict, context: RequestContext) -> dict:
     """Handle AgentBase POST /invocations requests.
@@ -81,6 +115,8 @@ def handler(payload: dict, context: RequestContext) -> dict:
     Supported operations:
     - analyze: analyze a provided incident JSON.
     - generate: generate one synthetic incident.
+    - proactive_alert: generate/analyze/notify a synthetic incident.
+    - record_incident: normalize a user report, analyze it, and respond.
     - evaluate: generate/evaluate a synthetic dataset, or evaluate provided incidents.
     """
 
@@ -90,20 +126,10 @@ def handler(payload: dict, context: RequestContext) -> dict:
         return _generate_from_payload(payload)
 
     if operation == "demo_alert":
-        generated = _generate_from_payload(payload, default_prefix="INC-DEMO-ALERT")
-        if generated.get("status") != "success":
-            return generated
-        incident = generated["incident"]
-        return {
-            "status": "success",
-            "incident_type": generated["incident_type"],
-            "seed": generated["seed"],
-            "incident": incident,
-            "assessment": analyze_incident(
-                incident,
-                send_telegram=_as_bool(payload.get("send_telegram"), default=True),
-            ),
-        }
+        return _alert_from_generated(payload, default_prefix="INC-DEMO-ALERT")
+
+    if operation in {"proactive_alert", "proactive_check"}:
+        return _alert_from_generated(payload, default_prefix="INC-PROACTIVE")
 
     if operation == "evaluate":
         incidents = payload.get("incidents")
@@ -124,6 +150,26 @@ def handler(payload: dict, context: RequestContext) -> dict:
                 incident,
                 send_telegram=_as_bool(payload.get("send_telegram"), default=False),
             ),
+        }
+
+    if operation in {"record_incident", "submit_incident", "user_report", "triage_incident"}:
+        try:
+            normalized = build_incident_from_report(payload)
+        except ValueError as exc:
+            return {"status": "error", "message": str(exc)}
+
+        incident = normalized["incident"]
+        assessment = analyze_incident(
+            incident,
+            send_telegram=_as_bool(payload.get("send_telegram"), default=False),
+        )
+        return {
+            "status": "success",
+            "workflow": "record_incident",
+            "intake": normalized["intake"],
+            "incident": incident,
+            "assessment": assessment,
+            "reply": _analyst_reply(incident, assessment),
         }
 
     return {"status": "error", "message": f"Unsupported operation: {operation}"}

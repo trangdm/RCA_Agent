@@ -67,6 +67,41 @@ class AIOpsMVPTest(unittest.TestCase):
         self.assertIn("assessment", response)
         self.assertNotIn("telegram_delivery", response["assessment"])
 
+    def test_agentbase_proactive_alert_without_telegram(self):
+        response = handler(
+            {"operation": "proactive_alert", "incident_type": "random", "seed": 2613, "send_telegram": False},
+            None,
+        )
+        self.assertEqual(response["status"], "success")
+        self.assertEqual(response["workflow"], "proactive_alert")
+        self.assertIn("reply", response)
+        self.assertNotIn("telegram_delivery", response["assessment"])
+
+    def test_agentbase_record_incident_from_message(self):
+        response = handler(
+            {
+                "operation": "record_incident",
+                "message": "Fortigate CPU high and session spike after firewall policy change",
+                "source": "FGT-HQ-01",
+                "severity": "critical",
+                "send_telegram": False,
+            },
+            None,
+        )
+        self.assertEqual(response["status"], "success")
+        self.assertEqual(response["workflow"], "record_incident")
+        self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Firewall Session Exhaustion")
+        self.assertIn("reply", response)
+
+    def test_agentbase_record_incident_undetermined_when_too_vague(self):
+        response = handler(
+            {"operation": "record_incident", "message": "Need someone to look at this", "send_telegram": False},
+            None,
+        )
+        self.assertEqual(response["status"], "success")
+        self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Undetermined")
+        self.assertTrue(response["assessment"]["root_cause_analysis"]["needs_more_evidence"])
+
 
 if __name__ == "__main__":
     unittest.main()

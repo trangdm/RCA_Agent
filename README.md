@@ -155,6 +155,31 @@ Generate a random incident, analyze it, and send the Telegram alert:
 
 For a dry run that does not send Telegram, set `send_telegram` to `false`.
 
+Proactively generate, analyze, and notify a synthetic incident:
+
+```json
+{
+  "operation": "proactive_alert",
+  "incident_type": "random",
+  "send_telegram": true
+}
+```
+
+Record an incident reported by an operator, analyze it, and return a reply:
+
+```json
+{
+  "operation": "record_incident",
+  "message": "Fortigate CPU high, session count spikes after a firewall policy change. Users report slow internet.",
+  "source": "FGT-HQ-01",
+  "severity": "critical",
+  "send_telegram": false
+}
+```
+
+`record_incident` also accepts a full `incident` JSON payload if the caller
+already has structured alert, metric, log, topology, and change-history data.
+
 ## Run Server Locally
 
 ```powershell
