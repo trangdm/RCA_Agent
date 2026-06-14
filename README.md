@@ -195,52 +195,32 @@ Invoke-RestMethod -Method Post `
 After that, users can chat directly with the bot:
 
 ```text
-tạo ra incident ngẫu nhiên
-internet chậm kết nối hãy kiểm tra có gì bất thường hay không
-mất kết nối server DB-01 có gì bất thường không
-port ge-0/0/1 bị flap nhiều lần có ghi nhận gì bất thường không
+internet chậm từ 09:30-10:00, packet loss cao, user chi nhánh HCM bị ảnh hưởng
+log firewall có bandwidth saturation và qos queue full
+giả định của tôi là backup replication làm nghẽn WAN
+timeline/log đáng chú ý là gì
+có change cấu hình trong khoảng 09:30-10:00 không
+root cause hiện tại và bằng chứng là gì
 ```
 
-The agent treats open-ended Telegram messages as demo incident intake: it
-generates the closest related synthetic incident, runs RCA, and sends the
-formatted Telegram assessment back to the same chat.
+The agent keeps one active investigation session per Telegram chat. The first
+message opens an investigation; later messages are treated as added evidence,
+operator hypotheses, impact scope, suspected objects, time windows, or analyst
+questions. Each update rebuilds the synthetic incident context, checks the
+available logs/metrics/change history, rebuilds the timeline/correlation chain,
+reruns RCA, and replies in the same chat.
 
-Telegram alerts are summary-first:
+Useful chat commands:
 
-- Top root cause and confidence.
-- Top hypotheses with estimated probabilities.
-- Short timeline snapshot with truncated log text.
-- One immediate next action.
-- Inline buttons for `Timeline`, `Evidence`, `Actions`, and `Full` detail.
-
-## Proactive Alerting Strategy
-
-In this MVP the agent does not connect to real infrastructure, so proactive
-alerting is represented by a scheduler or webhook calling:
-
-```json
-{
-  "operation": "proactive_alert",
-  "incident_type": "random",
-  "send_telegram": true
-}
+```text
+/new <incident description>   start a new investigation
+/close                       close the current investigation
+tạo ra incident ngẫu nhiên    generate a standalone demo alert
 ```
 
-For a real deployment, the same workflow can be driven by a lightweight poller:
-
-1. Every N minutes, query logs/metrics for a time window such as `now-5m..now`.
-2. Normalize raw records into the same incident contract: alert, metrics, logs,
-   topology, and change history.
-3. Apply rule/anomaly triggers, for example error-rate spike, repeated port
-   flaps, CPU/session threshold breach, DNS timeout rate, or DB connectivity
-   failures.
-4. Deduplicate with a fingerprint such as `root_cause + impacted_node +
-   service + window`, then apply a cooldown to avoid Telegram spam.
-5. Send only the compact RCA alert to Telegram; keep full timeline/evidence
-   behind buttons.
-
-This keeps the chat readable while preserving enough forensic detail for
-follow-up investigation.
+MVP note: the agent does not connect to production systems yet. Log, metric,
+topology, and change data are synthetic or supplied by the operator in chat/API
+payloads.
 
 ## Run Server Locally
 

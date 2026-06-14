@@ -10,10 +10,13 @@ from aiops_incident_agent.generator import generate_dataset
 from aiops_incident_agent.pipeline import analyze_incident
 from aiops_incident_agent.telegram import format_telegram_payload
 from aiops_incident_agent.timeline import build_timeline
-from main import handler
+from main import INVESTIGATION_SESSIONS, handler
 
 
 class AIOpsMVPTest(unittest.TestCase):
+    def setUp(self):
+        INVESTIGATION_SESSIONS.clear()
+
     def test_generate_balanced_dataset(self):
         incidents = generate_dataset(per_category=20, seed=123)
         self.assertEqual(len(incidents), 60)
@@ -43,14 +46,9 @@ class AIOpsMVPTest(unittest.TestCase):
         self.assertIn("recommendations", assessment)
         self.assertIn("telegram_report", assessment)
         self.assertEqual(assessment["root_cause_analysis"]["root_cause"], incident["ground_truth_root_cause"])
-        self.assertIn("hypothesis_summary", assessment["root_cause_analysis"])
-        self.assertIn("<b>AIOps Incident Alert</b>", assessment["telegram_report"])
-        self.assertIn("<b>Giả định & xác suất</b>", assessment["telegram_report"])
+        self.assertIn("<b>AIOps Incident Assessment</b>", assessment["telegram_report"])
         self.assertIn("<code>", assessment["telegram_report"])
-        payload = format_telegram_payload(assessment["telegram_report"])
-        self.assertEqual(payload["parse_mode"], "HTML")
-        self.assertNotIn("reply_markup", payload)
-        self.assertNotIn("Use the buttons", assessment["telegram_report"])
+        self.assertEqual(format_telegram_payload(assessment["telegram_report"])["parse_mode"], "HTML")
 
     def test_accuracy_threshold(self):
         incidents = generate_dataset(per_category=20, seed=42)
@@ -119,7 +117,6 @@ class AIOpsMVPTest(unittest.TestCase):
         self.assertEqual(response["workflow"], "telegram_chat")
         self.assertEqual(response["intent"], "proactive_alert")
         self.assertIn("assessment", response)
-        self.assertEqual(response["telegram_delivery"]["sent"], True)
 
     def test_telegram_chat_internet_slow_maps_to_congestion(self):
         with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
@@ -130,8 +127,8 @@ class AIOpsMVPTest(unittest.TestCase):
                     "text": "internet chậm kết nối hãy kiểm tra có gì bất thường hay không",
                 },
                 None,
-            )
-        self.assertEqual(response["intent"], "record_incident")
+        )
+        self.assertEqual(response["intent"], "start_investigation")
         self.assertEqual(response["intake"]["matched_template"], "internet-congestion")
         self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Internet Congestion")
 
@@ -140,11 +137,12 @@ class AIOpsMVPTest(unittest.TestCase):
             response = handler(
                 {
                     "operation": "telegram_chat",
-                    "chat_id": 12345,
+                    "chat_id": 12346,
                     "text": "mất kết nối server DB-01 có gì bất thường không",
                 },
                 None,
             )
+        self.assertEqual(response["intent"], "start_investigation")
         self.assertEqual(response["intake"]["matched_template"], "service-crash")
         self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Service Crash")
 
@@ -153,53 +151,52 @@ class AIOpsMVPTest(unittest.TestCase):
             response = handler(
                 {
                     "operation": "telegram_chat",
-                    "chat_id": 12345,
+                    "chat_id": 12347,
                     "text": "port ge-0/0/1 bị flap nhiều lần có ghi nhận gì bất thường không",
                 },
                 None,
             )
+        self.assertEqual(response["intent"], "start_investigation")
         self.assertEqual(response["intake"]["matched_template"], "interface-flapping")
         self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Interface Flapping")
 
-    def test_telegram_chat_camera_down_maps_to_access_port_down(self):
+    def test_telegram_multi_turn_investigation_accumulates_context(self):
+        chat_id = 77701
         with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
-            response = handler(
+            first = handler(
                 {
                     "operation": "telegram_chat",
-                    "chat_id": 12346,
-                    "text": "camera 01 down, kiểm tra có gì bất thường không",
+                    "chat_id": chat_id,
+                    "text": "internet chậm từ 09:30-10:00, packet loss cao, user chi nhánh HCM bị ảnh hưởng",
                 },
                 None,
             )
-        self.assertEqual(response["intake"]["matched_template"], "camera-access-port-down")
-        self.assertEqual(response["assessment"]["root_cause_analysis"]["root_cause"], "Mistaken Camera Access Port Shutdown")
-        self.assertIn("ge-0/0/1", response["assessment"]["telegram_report"])
+            second = handler(
+                {
+                    "operation": "telegram_chat",
+                    "chat_id": chat_id,
+                    "text": "log firewall có bandwidth saturation và qos queue full; giả định của tôi là backup replication làm nghẽn WAN",
+                },
+                None,
+            )
+            question = handler(
+                {
+                    "operation": "telegram_chat",
+                    "chat_id": chat_id,
+                    "text": "timeline/log đáng chú ý là gì",
+                },
+                None,
+            )
 
-    def test_telegram_follow_up_checks_change_window(self):
-        update = {
-            "update_id": 2,
-            "message": {"message_id": 1, "chat": {"id": 12347}, "text": "camera 01 down"},
-        }
-        with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
-            first = handler(update, None)
-
-        follow_up = {
-            "update_id": 3,
-            "message": {
-                "message_id": 2,
-                "chat": {"id": 12347},
-                "text": "trong khoảng thời gian từ 03:00-03:10 có ai change cấu hình không",
-            },
-        }
-        with patch("main.send_telegram_report", return_value={"sent": True, "status_code": 200}):
-            detail = handler(follow_up, None)
-
-        self.assertEqual(first["assessment"]["root_cause_analysis"]["root_cause"], "Mistaken Camera Access Port Shutdown")
-        self.assertEqual(detail["workflow"], "telegram_chat")
-        self.assertEqual(detail["intent"], "follow_up")
-        self.assertIn("Change / Config Check", detail["reply"])
-        self.assertIn("Shutdown access port ge-0/0/1", detail["reply"])
-        self.assertEqual(detail["telegram_delivery"]["sent"], True)
+        self.assertEqual(first["intent"], "start_investigation")
+        self.assertEqual(second["intent"], "continue_investigation")
+        self.assertEqual(second["session"]["message_count"], 2)
+        self.assertIn("09:30-10:00", second["session"]["time_windows"])
+        self.assertEqual(second["assessment"]["root_cause_analysis"]["root_cause"], "Internet Congestion")
+        self.assertIn("RCA Investigation", second["reply"])
+        self.assertIn("09:30:00 UTC", second["reply"])
+        self.assertEqual(question["intent"], "continue_investigation")
+        self.assertIn("Timeline/log", question["reply"])
 
 
 if __name__ == "__main__":

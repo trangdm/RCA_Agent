@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import random
-import unicodedata
 from typing import Any
 
 from .catalog import TEMPLATES, IncidentTemplate
@@ -22,29 +21,6 @@ ROOT_CAUSE_ALIASES = {
         "cong chap chon",
         "interface flap",
         "port flap",
-        "ge 0/0/1",
-    ),
-    "Mistaken Camera Access Port Shutdown": (
-        "camera",
-        "camera 01",
-        "cam 01",
-        "cam01",
-        "cctv",
-        "vms",
-        "nvr",
-        "camera down",
-        "camera offline",
-        "camera unreachable",
-        "camera mat ket noi",
-        "mat ket noi camera",
-        "mat camera",
-        "khong xem duoc camera",
-        "port camera",
-        "switch port camera",
-        "poe camera",
-        "rtsp",
-        "heartbeat camera",
-        "camera heartbeat",
         "ge 0/0/1",
     ),
     "Routing Issue": ("routing", "route", "bgp", "ospf", "mat route", "routing loop"),
@@ -112,10 +88,7 @@ def _new_incident_id(prefix: str = "INC-USER") -> str:
 
 
 def _normalize_text(value: Any) -> str:
-    text = str(value or "").lower().replace("đ", "d")
-    text = "".join(
-        char for char in unicodedata.normalize("NFD", text) if unicodedata.category(char) != "Mn"
-    )
+    text = str(value or "").lower()
     replacements = {
         "á": "a",
         "à": "a",
