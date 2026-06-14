@@ -1,11 +1,15 @@
 from datetime import datetime
+import os
 import unittest
+
+os.environ["AIOPS_USE_LLM"] = "false"
 
 from aiops_incident_agent.evaluator import evaluate_incidents
 from aiops_incident_agent.generator import generate_dataset
 from aiops_incident_agent.pipeline import analyze_incident
 from aiops_incident_agent.telegram import format_telegram_payload
 from aiops_incident_agent.timeline import build_timeline
+from main import handler
 
 
 class AIOpsMVPTest(unittest.TestCase):
@@ -46,6 +50,22 @@ class AIOpsMVPTest(unittest.TestCase):
         incidents = generate_dataset(per_category=20, seed=42)
         evaluation = evaluate_incidents(incidents)
         self.assertGreaterEqual(evaluation["accuracy"], 0.70)
+
+    def test_agentbase_generate_random_incident(self):
+        response = handler({"operation": "generate", "incident_type": "random", "seed": 2609}, None)
+        self.assertEqual(response["status"], "success")
+        self.assertIn("incident_type", response)
+        self.assertIn("ground_truth_root_cause", response["incident"])
+
+    def test_agentbase_demo_alert_without_telegram(self):
+        response = handler(
+            {"operation": "demo_alert", "incident_type": "random", "seed": 2610, "send_telegram": False},
+            None,
+        )
+        self.assertEqual(response["status"], "success")
+        self.assertIn("incident", response)
+        self.assertIn("assessment", response)
+        self.assertNotIn("telegram_delivery", response["assessment"])
 
 
 if __name__ == "__main__":

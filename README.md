@@ -109,10 +109,13 @@ Generate one incident:
 ```json
 {
   "operation": "generate",
-  "incident_type": "broadcast-loop",
+  "incident_type": "random",
   "incident_id": "INC-DEMO"
 }
 ```
+
+Use a specific type by passing one of the catalog keys, for example
+`broadcast-loop`, `disk-full`, or `brute-force-attack`.
 
 Analyze an incident:
 
@@ -139,6 +142,18 @@ Evaluate generated incidents:
   "per_category": 20
 }
 ```
+
+Generate a random incident, analyze it, and send the Telegram alert:
+
+```json
+{
+  "operation": "demo_alert",
+  "incident_type": "random",
+  "send_telegram": true
+}
+```
+
+For a dry run that does not send Telegram, set `send_telegram` to `false`.
 
 ## Run Server Locally
 
