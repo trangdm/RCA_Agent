@@ -1,0 +1,17 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+.greennode.json
+.claude/
+.agentbase/
+.agentbase-state.json
+*.credentials.json
+.git/
+.gitignore
+tests/
+data/generated/
+incident.json
+assessment.json
