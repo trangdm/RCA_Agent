@@ -189,6 +189,14 @@ class AIOpsMVPTest(unittest.TestCase):
                 },
                 None,
             )
+            runbook = handler(
+                {
+                    "operation": "telegram_chat",
+                    "chat_id": chat_id,
+                    "text": "cho tôi command/check runbook để verify sự cố này",
+                },
+                None,
+            )
 
         self.assertEqual(first["intent"], "start_investigation")
         self.assertEqual(second["intent"], "continue_investigation")
@@ -200,6 +208,11 @@ class AIOpsMVPTest(unittest.TestCase):
         self.assertIn("09:30:00 UTC", second["reply"])
         self.assertEqual(question["intent"], "continue_investigation")
         self.assertIn("Timeline đáng chú ý", question["reply"])
+        self.assertEqual(runbook["intent"], "continue_investigation")
+        self.assertIn("runbook/check/action", runbook["reply"])
+        self.assertIn("Command/check gợi ý", runbook["reply"])
+        self.assertIn("show interface", runbook["reply"])
+        self.assertNotIn("Bạn gửi thêm giúp mình log raw", runbook["reply"])
 
 
 if __name__ == "__main__":

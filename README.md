@@ -210,6 +210,13 @@ questions. Each update rebuilds the synthetic incident context, checks the
 available logs/metrics/change history, rebuilds the timeline/correlation chain,
 reruns RCA, and replies in the same chat.
 
+Mental model: the agent is expected to already have read access to system logs,
+metrics, topology, and in-change data. The operator reports symptoms or asks
+exceptions; RCA is primarily built by chaining those system events over time.
+Questions about `command`, `check`, `action`, or `runbook` are handled as
+runbook requests and return safe verification commands/checklists for the
+current root cause.
+
 Useful chat commands:
 
 ```text

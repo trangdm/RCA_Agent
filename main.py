@@ -258,8 +258,24 @@ def _detect_focus(text: str) -> str:
         return "timeline"
     if any(term in normalized for term in ("root cause", "rca", "nguyen nhan", "gia dinh", "hypothesis", "bang chung", "evidence", "tai sao")):
         return "rca"
-    if any(term in normalized for term in ("action", "xu ly", "khuyen nghi", "verify", "xac minh")):
-        return "action"
+    if any(
+        term in normalized
+        for term in (
+            "action",
+            "xu ly",
+            "khuyen nghi",
+            "verify",
+            "xac minh",
+            "command",
+            "cmd",
+            "cau lenh",
+            "lenh",
+            "runbook",
+            "check",
+            "kiem tra",
+        )
+    ):
+        return "runbook"
     return "update"
 
 
@@ -398,8 +414,125 @@ def _format_action_section(assessment: dict) -> list[str]:
     rec = assessment.get("recommendations", {})
     actions = rec.get("immediate_actions", [])
     if not actions:
-        actions = ["Giữ nguyên hiện trạng, thu thập thêm log/metric/change trong incident window"]
+        actions = ["Giữ nguyên hiện trạng, đối chiếu timeline với log/metric/change đang có trước khi can thiệp"]
     return [f"{index}. {_html(action)}" for index, action in enumerate(actions[:5], start=1)]
+
+
+def _runbook_commands(root_cause: str) -> list[str]:
+    commands_by_root = {
+        "Internet Congestion": [
+            "show interface <WAN_INTERFACE> counters",
+            "show bandwidth or traffic-monitor top-talkers",
+            "show qos queue <WAN_INTERFACE>",
+            "show current backup/replication jobs",
+            "ping <external_probe_ip> repeat 20",
+            "traceroute <external_probe_ip>",
+        ],
+        "Firewall Session Exhaustion": [
+            "diagnose sys session stat",
+            "diagnose sys top 5 20",
+            "diagnose sys session list | head",
+            "show firewall policy",
+            "show system performance status",
+        ],
+        "Interface Flapping": [
+            "show interfaces ge-0/0/1 terse",
+            "show interfaces ge-0/0/1 extensive",
+            "show log messages | match ge-0/0/1",
+            "show lacp interfaces ge-0/0/1",
+            "show ethernet-switching table interface ge-0/0/1",
+        ],
+        "DNS Failure": [
+            "dig @<dns_server> <record>",
+            "dig +trace <record>",
+            "show dns forwarding status",
+            "show log dns | tail",
+            "ping <upstream_dns>",
+        ],
+        "Service Crash": [
+            "systemctl status <service>",
+            "journalctl -u <service> --since '<incident_start>' --until '<incident_end>'",
+            "tail -n 200 /var/log/<service>.log",
+            "ss -lntp | grep <port>",
+            "curl -vk http://localhost:<port>/health",
+        ],
+        "Disk Full": [
+            "df -h",
+            "du -xhd1 /var | sort -h",
+            "journalctl --disk-usage",
+            "lsof +L1",
+            "find /var/log -type f -size +500M -ls",
+        ],
+        "CPU Exhaustion": [
+            "top -b -n1 | head -40",
+            "ps -eo pid,ppid,cmd,%cpu,%mem --sort=-%cpu | head",
+            "uptime",
+            "vmstat 1 5",
+            "journalctl --since '<incident_start>' --until '<incident_end>' | tail -200",
+        ],
+        "Memory Leak": [
+            "free -m",
+            "ps -eo pid,ppid,cmd,%mem,rss --sort=-rss | head",
+            "dmesg -T | grep -i oom",
+            "journalctl --since '<incident_start>' --until '<incident_end>' | grep -i 'oom\\|killed\\|memory'",
+        ],
+        "VMware Datastore Full": [
+            "esxcli storage filesystem list",
+            "vim-cmd vmsvc/snapshot.get <vmid>",
+            "du -h /vmfs/volumes/<datastore> | sort -h | tail",
+            "vim-cmd hostsvc/datastore/listsummary",
+        ],
+        "Brute Force Attack": [
+            "grep -i 'failed password' /var/log/auth.log | tail -100",
+            "grep -i 'authentication failed' /var/log/secure | tail -100",
+            "show vpn ssl monitor",
+            "show log auth | tail",
+        ],
+        "Port Scanning": [
+            "show log ids | match scan",
+            "show session source <suspect_ip>",
+            "tcpdump -nn host <suspect_ip> and 'tcp[tcpflags] & tcp-syn != 0'",
+            "netstat -ant | awk '{print $5}' | sort | uniq -c | sort -nr | head",
+        ],
+    }
+    return commands_by_root.get(
+        root_cause,
+        [
+            "show logs around <incident_start>-<incident_end>",
+            "show recent changes or config audit",
+            "show health/status for <suspected_object>",
+            "show metrics cpu/memory/disk/network for the affected node",
+            "run service-specific health check",
+        ],
+    )
+
+
+def _format_runbook_section(assessment: dict) -> list[str]:
+    root = assessment.get("root_cause_analysis", {})
+    root_cause = str(root.get("root_cause", "Unknown"))
+    lines = [
+        f"Root cause đang bám theo: <code>{_html(root_cause)}</code>",
+        "Mình sẽ dùng runbook kiểm chứng, không đưa lệnh phá hoại hay thay đổi cấu hình trực tiếp.",
+        "",
+        "Checklist nhanh:",
+    ]
+    rec = assessment.get("recommendations", {})
+    checks = rec.get("verification_actions") or []
+    if checks:
+        lines.extend(f"• {_html(item)}" for item in checks[:4])
+    else:
+        lines.extend(
+            [
+                "• Đối chiếu alert với timeline log/metric/change",
+                "• Kiểm tra object bị ảnh hưởng và upstream/downstream dependency",
+                "• Xác minh impact đã hết trước khi đóng incident",
+            ]
+        )
+
+    lines.extend(["", "Command/check gợi ý:"])
+    for command in _runbook_commands(root_cause)[:8]:
+        lines.append(f"• <code>{_html(command)}</code>")
+    return lines
 
 
 def _system_timeline(assessment: dict) -> list[dict]:
@@ -429,12 +562,12 @@ def _evidence_snippets(assessment: dict, limit: int = 3) -> list[str]:
 def _natural_next_question(root: dict, focus: str) -> str:
     confidence = int(root.get("confidence", 0) or 0)
     if root.get("needs_more_evidence") or confidence < 70:
-        return "Bạn gửi thêm giúp mình log raw, metric hoặc change history trong khoảng thời gian lỗi; mình sẽ ráp lại timeline và giảm bớt giả định."
+        return "Mình đã rà log/metric/change đang có. Nếu có ngoại lệ ngoài hệ thống giám sát, ví dụ maintenance không có ticket hoặc thao tác thủ công, bạn bổ sung để mình cập nhật giả định."
     if focus == "change":
-        return "Nếu bạn có ticket/change ID hoặc config diff thật, gửi tiếp cho mình; mình sẽ đối chiếu với timeline hiện tại."
-    if focus == "action":
-        return "Sau khi bạn thử bước đầu tiên, gửi kết quả verify lại; mình sẽ xem root cause còn giữ được không."
-    return "Bạn có thể gửi thêm log, metric, impact hoặc hypothesis của bạn; mình sẽ cập nhật incident này và phân tích lại."
+        return "Change window đang là một phần chính của timeline. Bạn có thể hỏi tiếp runbook/command để mình đưa checklist kiểm chứng an toàn."
+    if focus == "runbook":
+        return "Nếu bạn muốn, hỏi tiếp theo thiết bị cụ thể như firewall, switch, Linux service hay VMware; mình sẽ bó hẹp command theo đúng nền tảng đó."
+    return "Nếu cần bước tiếp theo, bạn hỏi theo dạng runbook/check/command; còn RCA hiện tại mình sẽ tiếp tục bám theo timeline log/metric/change đã xâu chuỗi."
 
 
 def _format_investigation_reply(session: dict, incident: dict, assessment: dict, focus: str, latest_text: str) -> str:
@@ -445,9 +578,9 @@ def _format_investigation_reply(session: dict, incident: dict, assessment: dict,
     is_first_message = len(session["messages"]) == 1
     evidence = _evidence_snippets(assessment)
     incident_line = (
-        f"Mình đã tạo incident demo <code>{_html(session['incident_id'])}</code> từ mô tả của bạn và rà log/metric/change history synthetic tương ứng."
+        f"Mình đã tạo incident demo <code>{_html(session['incident_id'])}</code> từ mô tả của bạn và tự rà log, metric, topology cùng các change đang in-change trong bộ dữ liệu demo."
         if is_first_message
-        else f"Mình đã thêm thông tin này vào incident <code>{_html(session['incident_id'])}</code> và chạy lại RCA."
+        else f"Mình đã thêm thông tin này vào incident <code>{_html(session['incident_id'])}</code>, tự rà lại log/change liên quan và chạy lại RCA."
     )
 
     if root.get("needs_more_evidence") or root_cause == "Undetermined":
@@ -463,7 +596,7 @@ def _format_investigation_reply(session: dict, incident: dict, assessment: dict,
 
     if evidence:
         lines.append("")
-        lines.append("Mình dựa vào mấy tín hiệu chính này:")
+        lines.append("Mình dựa vào mấy tín hiệu chính này trong log/metric/change:")
         for item in evidence:
             lines.append(f"• <code>{_html(item)}</code>")
 
@@ -481,9 +614,9 @@ def _format_investigation_reply(session: dict, incident: dict, assessment: dict,
     elif focus == "rca":
         lines.extend(["", "Nếu nhìn riêng phần RCA thì ranking hiện tại là:"])
         lines.extend(_format_rca_section(assessment))
-    elif focus == "action":
-        lines.extend(["", "Mình sẽ xử lý theo thứ tự này trước:"])
-        lines.extend(_format_action_section(assessment))
+    elif focus == "runbook":
+        lines.extend(["", "Phần bạn hỏi là runbook/check/action, nên mình tách ra như sau:"])
+        lines.extend(_format_runbook_section(assessment))
     else:
         lines.extend(["", "Timeline ngắn mình thấy như sau:"])
         lines.extend(_format_timeline_section(assessment, limit=4))
@@ -550,7 +683,7 @@ def _help_reply() -> str:
             "• timeline/log đáng chú ý là gì",
             "• có change cấu hình trong khoảng 09:30-10:00 không",
             "• root cause hiện tại và bằng chứng là gì",
-            "• nên xử lý bước nào trước",
+            "• command/check/runbook để kiểm chứng an toàn",
             "",
             "Dùng /new để bắt đầu sự cố mới, /close để đóng investigation hiện tại.",
         ]
